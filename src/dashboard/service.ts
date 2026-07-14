@@ -138,11 +138,11 @@ export async function softDeleteDashboardMemories(
   entityType: DashboardEntityType,
   entityId: string,
   ids: string[],
-): Promise<number> {
-  if (ids.length === 0) return 0;
+): Promise<string[]> {
+  if (ids.length === 0) return [];
 
   const column = dashboardScopeColumn(entityType);
-  let deleted = 0;
+  const deleted: string[] = [];
   for (let start = 0; start < ids.length; start += 99) {
     const batch = ids.slice(start, start + 99);
     const placeholders = batch.map(() => '?').join(', ');
@@ -158,8 +158,9 @@ export async function softDeleteDashboardMemories(
       WHERE deleted_at IS NULL
         AND id IN (SELECT id FROM ranked_memories WHERE row_number > 1)
         AND id IN (${placeholders})
-    `).bind(entityId, ...batch).run();
-    deleted += result.meta.changes;
+      RETURNING id
+    `).bind(entityId, ...batch).all<{ id: string }>();
+    deleted.push(...result.results.map((row) => row.id));
   }
   return deleted;
 }

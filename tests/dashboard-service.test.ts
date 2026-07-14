@@ -85,9 +85,9 @@ describe('dashboard exact-text deduplication', () => {
       VALUES ('history-1', 'duplicate', 'ADD', 'Same', '{}', 'history-hash', 2)
     `).run();
 
-    expect(await softDeleteDashboardMemories(env, 'user', 'scope', ['duplicate', 'agent-duplicate'])).toBe(1);
+    expect(await softDeleteDashboardMemories(env, 'user', 'scope', ['duplicate', 'agent-duplicate'])).toEqual(['duplicate']);
     expect(await listDashboardDuplicateMemoryIds(env, 'user', 'scope')).toEqual([]);
-    expect(await softDeleteDashboardMemories(env, 'user', 'scope', ['duplicate'])).toBe(0);
+    expect(await softDeleteDashboardMemories(env, 'user', 'scope', ['duplicate'])).toEqual([]);
 
     await expect(env.DB.prepare('SELECT deleted_at FROM memories WHERE id = ?').bind('duplicate').first<{ deleted_at: number | null }>())
       .resolves.toEqual(expect.objectContaining({ deleted_at: expect.any(Number) }));
@@ -95,7 +95,7 @@ describe('dashboard exact-text deduplication', () => {
       .resolves.toEqual({ deleted_at: null });
     await expect(env.DB.prepare('SELECT COUNT(*) AS count FROM memory_history WHERE memory_id = ?').bind('duplicate').first<{ count: number }>())
       .resolves.toEqual({ count: 1 });
-    await expect(softDeleteDashboardMemories(env, 'user', 'scope', [])).resolves.toBe(0);
+    await expect(softDeleteDashboardMemories(env, 'user', 'scope', [])).resolves.toEqual([]);
   });
 
   it('rejects canonical and unique IDs even when they are supplied with a valid later duplicate', async () => {
@@ -103,7 +103,8 @@ describe('dashboard exact-text deduplication', () => {
     await seedMemory({ id: 'later-duplicate', userId: 'scope', content: 'Same', createdAt: 2 });
     await seedMemory({ id: 'unique', userId: 'scope', content: 'Different', createdAt: 1 });
 
-    await expect(softDeleteDashboardMemories(env, 'user', 'scope', ['canonical', 'unique', 'later-duplicate'])).resolves.toBe(1);
+    await expect(softDeleteDashboardMemories(env, 'user', 'scope', ['canonical', 'unique', 'later-duplicate']))
+      .resolves.toEqual(['later-duplicate']);
     await expect(env.DB.prepare('SELECT id FROM memories WHERE deleted_at IS NOT NULL ORDER BY id').all<{ id: string }>())
       .resolves.toEqual({ results: [{ id: 'later-duplicate' }], success: true, meta: expect.any(Object) });
   });
@@ -115,10 +116,23 @@ describe('dashboard exact-text deduplication', () => {
       await seedMemory({ id, userId: 'scope', content: 'Same', createdAt: index + 2 });
     }
 
-    await expect(softDeleteDashboardMemories(env, 'user', 'scope', ids)).resolves.toBe(100);
+    await expect(softDeleteDashboardMemories(env, 'user', 'scope', ids)).resolves.toEqual(ids);
     await expect(env.DB.prepare('SELECT COUNT(*) AS count FROM memories WHERE deleted_at IS NOT NULL').first<{ count: number }>())
       .resolves.toEqual({ count: 100 });
     await expect(env.DB.prepare('SELECT deleted_at FROM memories WHERE id = ?').bind('canonical').first<{ deleted_at: number | null }>())
+      .resolves.toEqual({ deleted_at: null });
+  });
+
+  it('does not soft-delete a selected ID that becomes canonical before deletion', async () => {
+    await seedMemory({ id: 'canonical', userId: 'scope', content: 'Same', createdAt: 1 });
+    await seedMemory({ id: 'stale-candidate', userId: 'scope', content: 'Same', createdAt: 2 });
+    const selected = await listDashboardDuplicateMemoryIds(env, 'user', 'scope');
+
+    expect(selected).toEqual(['stale-candidate']);
+    await env.DB.prepare('UPDATE memories SET deleted_at = unixepoch() WHERE id = ?').bind('canonical').run();
+
+    await expect(softDeleteDashboardMemories(env, 'user', 'scope', selected)).resolves.toEqual([]);
+    await expect(env.DB.prepare('SELECT deleted_at FROM memories WHERE id = ?').bind('stale-candidate').first<{ deleted_at: number | null }>())
       .resolves.toEqual({ deleted_at: null });
   });
 });
