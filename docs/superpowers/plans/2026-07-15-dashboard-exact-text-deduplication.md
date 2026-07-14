@@ -4,7 +4,7 @@
 
 **Goal:** Add a signed-dashboard-only tool that previews and removes active, exact-text duplicate memories within one selected user or agent entity.
 
-**Architecture:** Dashboard service functions query D1 for duplicate groups and deterministic removal IDs. The route authorizes and scopes requests, deletes those vector IDs first, then soft-deletes the same D1 records. The server-rendered dashboard consumes those endpoints with an explicit confirmation and refreshes entity/memory state after cleanup.
+**Architecture:** Dashboard service functions query D1 for duplicate groups and atomically soft-delete only still-valid duplicate candidates, returning their exact IDs. The route authorizes and scopes requests, then removes only those returned Vectorize IDs. The server-rendered dashboard consumes those endpoints with an explicit confirmation and refreshes entity/memory state after cleanup.
 
 **Tech Stack:** TypeScript, Hono, Cloudflare D1, Cloudflare Vectorize, Vitest, Wrangler.
 
@@ -47,7 +47,7 @@ expect(summary).toEqual({
 
 const candidates = await listDashboardDuplicateMemoryIds(env, 'user', 'user-1');
 expect(candidates).toEqual(['later-id', 'z-id']);
-expect(await softDeleteDashboardMemories(env, 'user', 'user-1', candidates)).toBe(2);
+expect(await softDeleteDashboardMemories(env, 'user', 'user-1', candidates)).toEqual(['later-id', 'z-id']);
 ```
 
 Assert that `later-id` and `z-id` are soft-deleted, the oldest/tie-breaker `a-id` records remain active, history rows remain, rerunning candidate selection returns `[]`, and an agent invocation never touches user records.
@@ -88,10 +88,10 @@ export async function listDashboardDuplicateMemoryIds(
 
 export async function softDeleteDashboardMemories(
   env: Env, entityType: DashboardEntityType, entityId: string, ids: string[],
-): Promise<number> { /* scoped D1 soft-delete */ }
+): Promise<string[]> { /* scoped D1 soft-delete returning exact IDs */ }
 ```
 
-Use the fixed scope column (`user_id` or `agent_id`), `deleted_at IS NULL`, `GROUP BY content HAVING COUNT(*) > 1`, a preview limit of 10 ordered by `content COLLATE NOCASE`, and a window `ROW_NUMBER() OVER (PARTITION BY content ORDER BY created_at ASC, id ASC)` to identify duplicates. Select only row numbers greater than one. The soft-delete update must constrain both the selected entity scope and selected IDs, set `deleted_at = unixepoch()`, and return the D1 changes count.
+Use the fixed scope column (`user_id` or `agent_id`), `deleted_at IS NULL`, `GROUP BY content HAVING COUNT(*) > 1`, a preview limit of 10 ordered by `content COLLATE NOCASE`, and a window `ROW_NUMBER() OVER (PARTITION BY content ORDER BY created_at ASC, id ASC)` to identify duplicates. Select only row numbers greater than one. The soft-delete update must constrain both the selected entity scope and selected IDs, set `deleted_at = unixepoch()`, and return only the IDs it actually soft-deleted.
 
 In `src/vectorize.ts`, add:
 
@@ -133,7 +133,7 @@ POST /dashboard/api/deduplication
 // -> { removed: 2 }
 ```
 
-Assert unauthenticated requests return `401`; malformed scope or missing `confirm: true` returns `400`; vector deletion is called before the D1 cleanup function; a cleanup returns only `removed`, never vector IDs; and the selected agent/user scope is passed unchanged.
+Assert unauthenticated requests return `401`; malformed scope or missing `confirm: true` returns `400`; D1 cleanup resolves before Vectorize deletion begins; a cleanup returns only `removed`, never vector IDs; and the selected agent/user scope is passed unchanged.
 
 - [ ] **Step 2: Run the focused API test to verify red**
 
@@ -156,14 +156,14 @@ dashboardRoutes.post('/api/deduplication', async (context) => {
   const body = await context.req.json<{ entity_type?: unknown; entity_id?: unknown; confirm?: unknown }>().catch(() => null);
   const scope = body === null ? undefined : dashboardScope(body.entity_type, body.entity_id, undefined);
   if (scope === undefined || body?.confirm !== true) return context.json({ error: 'Validation failed' }, 400);
-  const vectorIds = await listDashboardDuplicateMemoryIds(context.env, scope.entityType, scope.entityId);
+  const candidates = await listDashboardDuplicateMemoryIds(context.env, scope.entityType, scope.entityId);
+  const vectorIds = await softDeleteDashboardMemories(context.env, scope.entityType, scope.entityId, candidates);
   await deleteVectors(context.env.VECTOR_INDEX, vectorIds);
-  const removed = await softDeleteDashboardMemories(context.env, scope.entityType, scope.entityId, vectorIds);
-  return context.json({ removed });
+  return context.json({ removed: vectorIds.length });
 });
 ```
 
-The route must obtain deterministic IDs without changing D1, call `deleteVectors`, then perform the scoped soft deletion using those exact IDs. It returns only `{ removed }`.
+The route must obtain deterministic IDs, ask D1 to atomically soft-delete and return the IDs that remain valid duplicates, then delete exactly those vectors. It returns only `{ removed }`.
 
 - [ ] **Step 4: Run the focused API test to verify green**
 

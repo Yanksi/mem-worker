@@ -23,7 +23,7 @@ Give dashboard operators a deliberate, scoped way to remove active memories that
 
 `src/dashboard/service.ts` owns scope-safe SQL queries. It will expose a summary containing duplicate-group and removable-record counts plus a bounded preview, a deterministic duplicate-ID selection, and a scoped soft-delete operation for those exact IDs.
 
-`src/routes/dashboard.ts` exposes authenticated dashboard endpoints for the summary and the confirmed cleanup. The cleanup handler selects duplicate IDs, deletes their Vectorize vectors, then soft-deletes those exact D1 records. A Vectorize failure therefore leaves every D1 record active and safely retryable; D1 never hard-deletes memory or audit data.
+`src/routes/dashboard.ts` exposes authenticated dashboard endpoints for the summary and the confirmed cleanup. The cleanup handler asks D1 to atomically confirm and soft-delete current duplicate candidates, then removes exactly the returned Vectorize IDs. It also retries Vectorize deletion for any previously soft-deleted memory IDs in the selected entity, so a retry of the dashboard action repairs a transient prior Vectorize failure even when there are no new duplicates. This order ensures a Vectorize failure can leave only inert vectors for already-deleted memories; it can never make an active memory unsearchable. D1 never hard-deletes memory or audit data.
 
 `src/dashboard/page.ts` adds the navigation view, renders the scoped summary and preview safely with DOM APIs, and asks for a browser confirmation before its cleanup request. It refreshes the current entity list and memory view after a successful cleanup.
 
@@ -33,7 +33,7 @@ Give dashboard operators a deliberate, scoped way to remove active memories that
 - All deduplication dashboard API calls require the existing signed dashboard session.
 - A summary with no duplicates is successful and disables the cleanup action.
 - Cleanup remains idempotent: rerunning after a successful cleanup returns zero removed records.
-- Vectorize deletion receives only IDs soft-deleted by that request.
+- Vectorize deletion receives only IDs D1 successfully soft-deleted in that request plus already-soft-deleted IDs in the same selected entity, allowing operator retries to repair earlier Vectorize failures.
 
 ## Tests
 
