@@ -1,0 +1,149 @@
+import { sql } from 'drizzle-orm';
+import {
+  index,
+  integer,
+  primaryKey,
+  real,
+  sqliteTable,
+  text,
+  uniqueIndex,
+} from 'drizzle-orm/sqlite-core';
+
+const createdAt = integer('created_at').notNull().default(sql`(unixepoch())`);
+const updatedAt = integer('updated_at').notNull().default(sql`(unixepoch())`);
+
+export const apiKeys = sqliteTable(
+  'api_keys',
+  {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    keyHash: text('key_hash').notNull(),
+    scopesJson: text('scopes_json').notNull().default('[]'),
+    createdAt,
+    expiresAt: integer('expires_at'),
+    lastUsedAt: integer('last_used_at'),
+    revokedAt: integer('revoked_at'),
+  },
+  (table) => [uniqueIndex('api_keys_key_hash_idx').on(table.keyHash)],
+);
+
+export const memories = sqliteTable(
+  'memories',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id').notNull(),
+    agentId: text('agent_id'),
+    runId: text('run_id'),
+    actorId: text('actor_id'),
+    content: text('content').notNull(),
+    metadataJson: text('metadata_json').notNull().default('{}'),
+    hash: text('hash').notNull(),
+    createdAt,
+    updatedAt,
+    deletedAt: integer('deleted_at'),
+  },
+  (table) => [
+    index('memories_user_agent_deleted_at_idx').on(
+      table.userId,
+      table.agentId,
+      table.deletedAt,
+    ),
+    index('memories_hash_idx').on(table.hash),
+  ],
+);
+
+export const memoryHistory = sqliteTable(
+  'memory_history',
+  {
+    id: text('id').primaryKey(),
+    memoryId: text('memory_id')
+      .notNull()
+      .references(() => memories.id, { onDelete: 'cascade' }),
+    operation: text('operation').notNull(),
+    content: text('content').notNull(),
+    metadataJson: text('metadata_json').notNull().default('{}'),
+    hash: text('hash').notNull(),
+    createdAt,
+  },
+  (table) => [index('memory_history_memory_created_at_idx').on(table.memoryId, table.createdAt)],
+);
+
+export const entities = sqliteTable(
+  'entities',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id').notNull(),
+    name: text('name').notNull(),
+    type: text('type').notNull(),
+    metadataJson: text('metadata_json').notNull().default('{}'),
+    createdAt,
+    updatedAt,
+  },
+  (table) => [uniqueIndex('entities_user_name_type_idx').on(table.userId, table.name, table.type)],
+);
+
+export const relationships = sqliteTable(
+  'relationships',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id').notNull(),
+    sourceEntityId: text('source_entity_id')
+      .notNull()
+      .references(() => entities.id, { onDelete: 'cascade' }),
+    targetEntityId: text('target_entity_id')
+      .notNull()
+      .references(() => entities.id, { onDelete: 'cascade' }),
+    relationType: text('relation_type').notNull(),
+    confidence: real('confidence'),
+    evidenceMemoryId: text('evidence_memory_id').references(() => memories.id, {
+      onDelete: 'set null',
+    }),
+    metadataJson: text('metadata_json').notNull().default('{}'),
+    createdAt,
+    updatedAt,
+  },
+  (table) => [
+    index('relationships_source_entity_idx').on(table.sourceEntityId),
+    index('relationships_target_entity_idx').on(table.targetEntityId),
+    index('relationships_evidence_memory_idx').on(table.evidenceMemoryId),
+  ],
+);
+
+export const memoryEntityLinks = sqliteTable(
+  'memory_entity_links',
+  {
+    memoryId: text('memory_id')
+      .notNull()
+      .references(() => memories.id, { onDelete: 'cascade' }),
+    entityId: text('entity_id')
+      .notNull()
+      .references(() => entities.id, { onDelete: 'cascade' }),
+    createdAt,
+  },
+  (table) => [
+    primaryKey({ columns: [table.memoryId, table.entityId] }),
+    index('memory_entity_links_entity_memory_idx').on(table.entityId, table.memoryId),
+  ],
+);
+
+export const memoryRequests = sqliteTable(
+  'memory_requests',
+  {
+    userId: text('user_id').notNull(),
+    idempotencyKey: text('idempotency_key').notNull(),
+    agentId: text('agent_id'),
+    runId: text('run_id'),
+    status: text('status').notNull(),
+    resultJson: text('result_json'),
+    errorMessage: text('error_message'),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+    completedAt: text('completed_at'),
+    leaseToken: integer('lease_token').notNull().default(0),
+    candidatesJson: text('candidates_json'),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.idempotencyKey] }),
+    index('memory_requests_status_updated_at_idx').on(table.status, table.updatedAt),
+  ],
+);

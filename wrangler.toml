@@ -1,0 +1,27 @@
+name = "mem0-edge"
+main = "src/index.ts"
+compatibility_date = "2026-07-14"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mem0-edge"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "src/migrations"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "mem0-edge"
+
+[[queues.producers]]
+binding = "MEMORY_JOBS"
+queue = "mem0-edge-memory-jobs"
+
+[[queues.consumers]]
+queue = "mem0-edge-memory-jobs"
+
+[vars]
+EMBEDDING_MODEL = "text-embedding-3-small"
+LLM_MODEL = "gpt-4o-mini"
+LLM_API_BASE_URL = "https://api.openai.com/v1"
+VECTOR_DIMENSIONS = "1536"
+MEM0_INDEX_NAME = "mem0-edge"
