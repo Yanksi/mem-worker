@@ -14,8 +14,10 @@ export function deleteVector(index: VectorizeIndex, id: string) {
   return index.deleteByIds([id]);
 }
 
-export function deleteVectors(index: VectorizeIndex, ids: string[]) {
-  return index.deleteByIds(ids);
+export async function deleteVectors(index: VectorizeIndex, ids: string[]): Promise<void> {
+  for (let start = 0; start < ids.length; start += 100) {
+    await index.deleteByIds(ids.slice(start, start + 100));
+  }
 }
 
 export async function searchVectors(

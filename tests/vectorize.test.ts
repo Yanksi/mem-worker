@@ -19,14 +19,38 @@ describe('Vectorize wrappers', () => {
     expect(index.deleteByIds).toHaveBeenCalledWith(['memory-123']);
   });
 
-  it('deletes a batch of duplicate vector IDs in one call', async () => {
+  it('deletes arbitrary vector IDs in sequential batches of 100', async () => {
     const index = { deleteByIds: vi.fn().mockResolvedValue({}) } as unknown as VectorizeIndex;
-    const ids = ['memory-456', 'memory-789'];
+    const ids = Array.from({ length: 201 }, (_, index) => `memory-${index}`);
 
     await deleteVectors(index, ids);
 
-    expect(index.deleteByIds).toHaveBeenCalledOnce();
-    expect(index.deleteByIds).toHaveBeenCalledWith(ids);
+    expect(index.deleteByIds).toHaveBeenCalledTimes(3);
+    expect(index.deleteByIds).toHaveBeenNthCalledWith(1, ids.slice(0, 100));
+    expect(index.deleteByIds).toHaveBeenNthCalledWith(2, ids.slice(100, 200));
+    expect(index.deleteByIds).toHaveBeenNthCalledWith(3, ids.slice(200));
+  });
+
+  it('does not call Vectorize when no IDs are supplied', async () => {
+    const index = { deleteByIds: vi.fn() } as unknown as VectorizeIndex;
+
+    await deleteVectors(index, []);
+
+    expect(index.deleteByIds).not.toHaveBeenCalled();
+  });
+
+  it('stops after a rejected batch and propagates the failure', async () => {
+    const failure = new Error('Vectorize unavailable');
+    const index = {
+      deleteByIds: vi.fn().mockResolvedValueOnce({}).mockRejectedValueOnce(failure),
+    } as unknown as VectorizeIndex;
+    const ids = Array.from({ length: 201 }, (_, index) => `memory-${index}`);
+
+    await expect(deleteVectors(index, ids)).rejects.toBe(failure);
+
+    expect(index.deleteByIds).toHaveBeenCalledTimes(2);
+    expect(index.deleteByIds).toHaveBeenNthCalledWith(1, ids.slice(0, 100));
+    expect(index.deleteByIds).toHaveBeenNthCalledWith(2, ids.slice(100, 200));
   });
 
   it('caps topK, scopes its filter, returns metadata, and omits vector values', async () => {
