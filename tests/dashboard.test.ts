@@ -96,6 +96,32 @@ describe('GET /dashboard', () => {
     expect(html).toContain('/dashboard/api/imports/mem0');
     expect(html).toContain('queued');
   });
+
+  it('renders exact-text deduplication navigation and its confirmed dashboard API contract', async () => {
+    const response = await worker.fetch(request('/dashboard', {
+      headers: { 'x-dashboard-password': 'dashboard-secret' },
+    }), env);
+    const html = await response.text();
+
+    expect(html).toContain('data-view="deduplicate"');
+    expect(html.indexOf('data-view="deduplicate"')).toBeGreaterThan(html.indexOf('data-view="memories"'));
+    expect(html).toContain('Deduplicate memories');
+    expect(html).toContain('id="deduplication-status"');
+    expect(html).toContain('id="deduplication-summary"');
+    expect(html).toMatch(/id="deduplicate-button"[^>]*disabled/);
+    expect(html).toContain('/dashboard/api/deduplication?entity_type=');
+    expect(html).toContain("window.confirm('Remove ' + deduplication.removable_memories");
+    expect(html).toContain("method: 'POST'");
+    expect(html).toContain('confirm: true');
+    expect(html).toContain('const entityType = state.entityType; const entityId = state.entityId;');
+    expect(html).toContain('if (entityType !== state.entityType || entityId !== state.entityId) return;');
+    expect(html).toContain('function invalidateDeduplication()');
+    expect(html).toContain('invalidateDeduplication(); await loadMemories(true);');
+    expect(html).toContain('grid-template-columns: repeat(2, minmax(0, 1fr))');
+    expect(html).toContain('grid-auto-flow: row');
+    expect(html).toContain('.nav button { width: 100%; }');
+    expect(html).toContain('.logout { width: 100%;');
+  });
 });
 
 describe('dashboard login', () => {

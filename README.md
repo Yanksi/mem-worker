@@ -17,7 +17,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - Durable tenant-scoped idempotency records, retry-safe deterministic writes, and a Queue consumer for asynchronous ingestion.
 - Extracted entity and relationship persistence, plus read-only graph endpoints.
 - API-key authentication, per-user memory and graph isolation, and a signed-session operator dashboard with automatic user discovery.
-- Dashboard views for semantic search and paginated active-memory browsing across discovered user and agent entities, a bounded user entity/relationship graph, and dashboard-managed user-ID aliases.
+- Dashboard views for semantic search, paginated active-memory browsing, exact-text deduplication across discovered user and agent entities, a bounded user entity/relationship graph, and dashboard-managed user-ID aliases.
 - D1 migrations, local test coverage, Wrangler configuration, and a deployment guide.
 
 ## Not Included
@@ -28,7 +28,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - A Neo4j-style graph engine, unbounded graph traversal, advanced graph analytics, or agent-scoped graphs; graph support is bounded D1-backed storage and reads for user-scoped memories.
 - Automatic Cloudflare resource provisioning or secret creation. Deployment requires creating the D1 database, Vectorize index, Queue, metadata indexes, and secrets described below.
 - A general-purpose job-status API or dashboard job monitor beyond the durable ingestion behavior used internally by async memory requests.
-- Dashboard memory editing, deletion, bulk exports, graph editing, or graph traversal beyond the bounded read-only graph view. The dashboard can only create, change, or remove display aliases for stored user IDs.
+- Dashboard memory editing, general deletion, bulk exports, graph editing, or graph traversal beyond the bounded read-only graph view. Exact-text deduplication is the limited deletion exception; the dashboard can otherwise only create, change, or remove display aliases for stored user IDs.
 
 ## Architecture
 
@@ -100,11 +100,13 @@ The request is idempotent; use `request_id` when the caller needs a stable calle
 
 Open `$MEM0_URL/dashboard` and sign in with `DASHBOARD_PASSWORD`. The dashboard discovers user and agent entities from active memories, plus user IDs from stored graph entities and saved aliases. It never uses the service API key in the browser.
 
-Use the **User profile** selector to scope the three views:
+The dashboard offers:
 
-- **Search memory** performs semantic recall for the selected user.
-- **All memories** displays that user's active memories, newest first, with pagination and a detail inspector.
-- **Memory graph** displays a selected user's stored entities and relationships as a bounded interactive graph. Agent entities remain searchable and browsable, but do not have graph support in this implementation.
+- **Search memory** performs semantic recall for the selected user or agent.
+- **All memories** displays the selected entity's active memories, newest first, with pagination and a detail inspector.
+- **Deduplicate memories** is scoped to the selected user or agent and removes only active memories with exactly identical content. It preserves the oldest memory in each duplicate group, requires explicit confirmation, and soft-deletes the redundant memories so their history remains available. Re-running cleanup after an interrupted vector cleanup repairs the remaining vector cleanup without deleting additional memories.
+- **Memory graph** displays a selected user's stored entities and relationships as a bounded interactive graph; it is unavailable for agent entities.
+- **Import from Mem0** queues a `RawMemoryMigrationExport` for a chosen user or agent target.
 
 The adjacent **Edit** control saves a dashboard-managed alias in D1. Once set, the selector displays the alias rather than the raw user ID; aliases do not alter API ownership, Hermes identities, or stored memory data. Apply the latest D1 migration after upgrading to create the alias table.
 
