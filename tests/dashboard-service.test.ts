@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   getDashboardDeduplicationSummary,
   listDashboardDuplicateMemoryIds,
+  listDashboardSoftDeletedMemoryIds,
   softDeleteDashboardMemories,
 } from '../src/dashboard/service';
 import type { Env } from '../src/env';
@@ -74,6 +75,18 @@ describe('dashboard exact-text deduplication', () => {
 
     await expect(listDashboardDuplicateMemoryIds(env, 'user', 'shared')).resolves.toEqual(['b-tie', 'later-user']);
     await expect(listDashboardDuplicateMemoryIds(env, 'agent', 'shared')).resolves.toEqual(['agent-later']);
+  });
+
+  it('lists soft-deleted IDs by selected scope in id order', async () => {
+    await seedMemory({ id: 'user-z', userId: 'scope', content: 'One', createdAt: 1, deletedAt: 1 });
+    await seedMemory({ id: 'user-a', userId: 'scope', content: 'Two', createdAt: 1, deletedAt: 1 });
+    await seedMemory({ id: 'user-active', userId: 'scope', content: 'Three', createdAt: 1 });
+    await seedMemory({ id: 'agent-b', agentId: 'scope', content: 'Four', createdAt: 1, deletedAt: 1 });
+    await seedMemory({ id: 'other-user', userId: 'other', content: 'Five', createdAt: 1, deletedAt: 1 });
+
+    await expect(listDashboardSoftDeletedMemoryIds(env, 'user', 'scope')).resolves.toEqual(['user-a', 'user-z']);
+    await expect(listDashboardSoftDeletedMemoryIds(env, 'agent', 'scope')).resolves.toEqual(['agent-b']);
+    await expect(listDashboardSoftDeletedMemoryIds(env, 'user', 'empty')).resolves.toEqual([]);
   });
 
   it('soft-deletes only selected scoped duplicates, preserves history, and is idempotent', async () => {

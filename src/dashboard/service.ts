@@ -133,6 +133,21 @@ export async function listDashboardDuplicateMemoryIds(
   return result.results.map((row) => row.id);
 }
 
+export async function listDashboardSoftDeletedMemoryIds(
+  env: Env,
+  entityType: DashboardEntityType,
+  entityId: string,
+): Promise<string[]> {
+  const column = dashboardScopeColumn(entityType);
+  const result = await env.DB.prepare(`
+    SELECT id
+    FROM memories
+    WHERE ${column} = ? AND deleted_at IS NOT NULL
+    ORDER BY id ASC
+  `).bind(entityId).all<{ id: string }>();
+  return result.results.map((row) => row.id);
+}
+
 export async function softDeleteDashboardMemories(
   env: Env,
   entityType: DashboardEntityType,
