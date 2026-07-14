@@ -5,6 +5,12 @@ const dashboardService = vi.hoisted(() => ({
   listDashboardUsers: vi.fn(),
   setDashboardUserAlias: vi.fn(),
   listDashboardMemories: vi.fn(),
+  getDashboardDeduplicationSummary: vi.fn(),
+  listDashboardDuplicateMemoryIds: vi.fn(),
+  softDeleteDashboardMemories: vi.fn(),
+}));
+const vectorize = vi.hoisted(() => ({
+  deleteVectors: vi.fn(),
 }));
 const graphService = vi.hoisted(() => ({
   listEntities: vi.fn(),
@@ -19,13 +25,14 @@ const importService = vi.hoisted(() => ({
 }));
 
 vi.mock('../src/dashboard/service', () => dashboardService);
+vi.mock('../src/vectorize', () => vectorize);
 vi.mock('../src/graph/service', () => graphService);
 vi.mock('../src/memory/service', () => memoryService);
 vi.mock('../src/import/service', () => importService);
 
 import worker from '../src/index';
 
-const env = { DASHBOARD_PASSWORD: 'dashboard-secret' } as Env;
+const env = { DASHBOARD_PASSWORD: 'dashboard-secret', VECTORIZE: {} as VectorizeIndex } as Env;
 
 function request(path: string, init?: RequestInit): Request {
   return new Request(`https://example.com${path}`, init);
@@ -49,6 +56,128 @@ describe('dashboard operator API', () => {
     expect(response.status).toBe(401);
     await expect(response.json()).resolves.toEqual({ error: 'Unauthorized' });
     expect(dashboardService.listDashboardUsers).not.toHaveBeenCalled();
+  });
+
+  it('requires a signed dashboard session for deduplication endpoints', async () => {
+    const getResponse = await worker.fetch(request('/dashboard/api/deduplication?entity_type=agent&entity_id=hermes'), env);
+    const postResponse = await worker.fetch(request('/dashboard/api/deduplication', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity_type: 'agent', entity_id: 'hermes', confirm: true }),
+    }), env);
+
+    expect(getResponse.status).toBe(401);
+    expect(postResponse.status).toBe(401);
+    expect(dashboardService.getDashboardDeduplicationSummary).not.toHaveBeenCalled();
+    expect(dashboardService.listDashboardDuplicateMemoryIds).not.toHaveBeenCalled();
+  });
+
+  it('returns deduplication summaries for agent and user scopes', async () => {
+    dashboardService.getDashboardDeduplicationSummary
+      .mockResolvedValueOnce({ duplicate_groups: 1, removable_memories: 2, previews: [{ memory: 'Agent memory', duplicate_count: 2 }] })
+      .mockResolvedValueOnce({ duplicate_groups: 1, removable_memories: 1, previews: [{ memory: 'User memory', duplicate_count: 1 }] });
+    const cookie = await dashboardCookie();
+
+    const agentResponse = await worker.fetch(request('/dashboard/api/deduplication?entity_type=agent&entity_id=hermes', {
+      headers: { Cookie: cookie },
+    }), env);
+    const userResponse = await worker.fetch(request('/dashboard/api/deduplication?entity_type=user&entity_id=discord%3A42', {
+      headers: { Cookie: cookie },
+    }), env);
+
+    await expect(agentResponse.json()).resolves.toEqual({
+      duplicate_groups: 1, removable_memories: 2, previews: [{ memory: 'Agent memory', duplicate_count: 2 }],
+    });
+    await expect(userResponse.json()).resolves.toEqual({
+      duplicate_groups: 1, removable_memories: 1, previews: [{ memory: 'User memory', duplicate_count: 1 }],
+    });
+    expect(dashboardService.getDashboardDeduplicationSummary).toHaveBeenNthCalledWith(1, env, 'agent', 'hermes');
+    expect(dashboardService.getDashboardDeduplicationSummary).toHaveBeenNthCalledWith(2, env, 'user', 'discord:42');
+  });
+
+  it('rejects invalid deduplication scopes and confirmations', async () => {
+    const headers = { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' };
+    const missingGetScope = await worker.fetch(request('/dashboard/api/deduplication?entity_type=agent', { headers }), env);
+    const invalidGetScope = await worker.fetch(request('/dashboard/api/deduplication?entity_type=run&entity_id=run-1', { headers }), env);
+    const missingPostScope = await worker.fetch(request('/dashboard/api/deduplication', {
+      method: 'POST', headers, body: JSON.stringify({ entity_type: 'agent', confirm: true }),
+    }), env);
+    const invalidConfirmation = await worker.fetch(request('/dashboard/api/deduplication', {
+      method: 'POST', headers, body: JSON.stringify({ entity_type: 'user', entity_id: 'discord:42', confirm: 'true' }),
+    }), env);
+    const missingConfirmation = await worker.fetch(request('/dashboard/api/deduplication', {
+      method: 'POST', headers, body: JSON.stringify({ entity_type: 'user', entity_id: 'discord:42' }),
+    }), env);
+
+    expect(missingGetScope.status).toBe(400);
+    expect(invalidGetScope.status).toBe(400);
+    expect(missingPostScope.status).toBe(400);
+    expect(invalidConfirmation.status).toBe(400);
+    expect(missingConfirmation.status).toBe(400);
+    expect(dashboardService.getDashboardDeduplicationSummary).not.toHaveBeenCalled();
+    expect(dashboardService.listDashboardDuplicateMemoryIds).not.toHaveBeenCalled();
+  });
+
+  it('deletes agent duplicate vectors before soft-deleting memories and only returns the removal count', async () => {
+    dashboardService.listDashboardDuplicateMemoryIds.mockResolvedValue(['memory-2', 'memory-3']);
+    vectorize.deleteVectors.mockResolvedValue(undefined);
+    dashboardService.softDeleteDashboardMemories.mockResolvedValue(2);
+
+    const response = await worker.fetch(request('/dashboard/api/deduplication', {
+      method: 'POST',
+      headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity_type: 'agent', entity_id: 'hermes', confirm: true }),
+    }), env);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ removed: 2 });
+    expect(dashboardService.listDashboardDuplicateMemoryIds).toHaveBeenCalledWith(env, 'agent', 'hermes');
+    expect(vectorize.deleteVectors).toHaveBeenCalledWith(env.VECTORIZE, ['memory-2', 'memory-3']);
+    expect(dashboardService.softDeleteDashboardMemories).toHaveBeenCalledWith(env, 'agent', 'hermes', ['memory-2', 'memory-3']);
+    expect(dashboardService.listDashboardDuplicateMemoryIds.mock.invocationCallOrder[0])
+      .toBeLessThan(vectorize.deleteVectors.mock.invocationCallOrder[0]);
+    expect(vectorize.deleteVectors.mock.invocationCallOrder[0])
+      .toBeLessThan(dashboardService.softDeleteDashboardMemories.mock.invocationCallOrder[0]);
+  });
+
+  it('waits for duplicate vector deletion before soft-deleting memories', async () => {
+    let resolveVectorDeletion: (() => void) | undefined;
+    dashboardService.listDashboardDuplicateMemoryIds.mockResolvedValue(['memory-2']);
+    vectorize.deleteVectors.mockImplementation(() => new Promise<void>((resolve) => {
+      resolveVectorDeletion = resolve;
+    }));
+    dashboardService.softDeleteDashboardMemories.mockResolvedValue(1);
+
+    const responsePromise = worker.fetch(request('/dashboard/api/deduplication', {
+      method: 'POST',
+      headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity_type: 'agent', entity_id: 'hermes', confirm: true }),
+    }), env);
+
+    await vi.waitFor(() => expect(vectorize.deleteVectors).toHaveBeenCalledTimes(1));
+    expect(dashboardService.softDeleteDashboardMemories).not.toHaveBeenCalled();
+
+    resolveVectorDeletion!();
+    const response = await responsePromise;
+
+    expect(response.status).toBe(200);
+    expect(dashboardService.softDeleteDashboardMemories).toHaveBeenCalledWith(env, 'agent', 'hermes', ['memory-2']);
+  });
+
+  it('does not delete when a user scope has no duplicate candidates', async () => {
+    dashboardService.listDashboardDuplicateMemoryIds.mockResolvedValue([]);
+
+    const response = await worker.fetch(request('/dashboard/api/deduplication', {
+      method: 'POST',
+      headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity_type: 'user', entity_id: 'discord:42', confirm: true }),
+    }), env);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ removed: 0 });
+    expect(dashboardService.listDashboardDuplicateMemoryIds).toHaveBeenCalledWith(env, 'user', 'discord:42');
+    expect(vectorize.deleteVectors).not.toHaveBeenCalled();
+    expect(dashboardService.softDeleteDashboardMemories).not.toHaveBeenCalled();
   });
 
   it('discovers users through the dashboard service', async () => {

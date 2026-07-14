@@ -1,12 +1,20 @@
 import { Hono } from 'hono';
 import { checkDashboardPassword } from '../auth';
 import { renderDashboard, renderDashboardLogin } from '../dashboard/page';
-import { listDashboardMemories, listDashboardUsers, setDashboardUserAlias } from '../dashboard/service';
+import {
+  getDashboardDeduplicationSummary,
+  listDashboardDuplicateMemoryIds,
+  listDashboardMemories,
+  listDashboardUsers,
+  setDashboardUserAlias,
+  softDeleteDashboardMemories,
+} from '../dashboard/service';
 import type { Env } from '../env';
 import { listEntities, listRelationships } from '../graph/service';
 import { enqueueMem0AgentReclassification, enqueueMem0Import } from '../import/service';
 import { DashboardMem0ImportRequest } from '../import/types';
 import { searchMemories } from '../memory/service';
+import { deleteVectors } from '../vectorize';
 
 type DashboardEntityType = 'user' | 'agent';
 
@@ -63,6 +71,25 @@ dashboardRoutes.get('/api/memories', async (context) => {
   const requestedOffset = Number(context.req.query('offset') ?? '0');
   const offset = Number.isInteger(requestedOffset) && requestedOffset >= 0 ? requestedOffset : 0;
   return context.json(await listDashboardMemories(context.env, scope.entityType, scope.entityId, offset));
+});
+
+dashboardRoutes.get('/api/deduplication', async (context) => {
+  const scope = dashboardScope(context.req.query('entity_type'), context.req.query('entity_id'), undefined);
+  if (scope === undefined) return context.json({ error: 'Validation failed' }, 400);
+  return context.json(await getDashboardDeduplicationSummary(context.env, scope.entityType, scope.entityId));
+});
+
+dashboardRoutes.post('/api/deduplication', async (context) => {
+  const body = await context.req.json<{ entity_type?: unknown; entity_id?: unknown; confirm?: unknown }>().catch(() => null);
+  const scope = body === null ? undefined : dashboardScope(body.entity_type, body.entity_id, undefined);
+  if (scope === undefined || body?.confirm !== true) return context.json({ error: 'Validation failed' }, 400);
+
+  const ids = await listDashboardDuplicateMemoryIds(context.env, scope.entityType, scope.entityId);
+  if (ids.length === 0) return context.json({ removed: 0 });
+
+  await deleteVectors(context.env.VECTORIZE, ids);
+  const removed = await softDeleteDashboardMemories(context.env, scope.entityType, scope.entityId, ids);
+  return context.json({ removed });
 });
 
 dashboardRoutes.post('/api/search', async (context) => {
