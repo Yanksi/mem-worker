@@ -5,6 +5,7 @@ import {
   getDashboardDeduplicationSummary,
   listDashboardDuplicateMemoryIds,
   listDashboardMemories,
+  listDashboardSoftDeletedMemoryIds,
   listDashboardUsers,
   setDashboardUserAlias,
   softDeleteDashboardMemories,
@@ -85,13 +86,12 @@ dashboardRoutes.post('/api/deduplication', async (context) => {
   if (scope === undefined || body?.confirm !== true) return context.json({ error: 'Validation failed' }, 400);
 
   const candidates = await listDashboardDuplicateMemoryIds(context.env, scope.entityType, scope.entityId);
-  if (candidates.length === 0) return context.json({ removed: 0 });
+  const confirmedIds = await softDeleteDashboardMemories(context.env, scope.entityType, scope.entityId, candidates);
+  const softDeletedIds = await listDashboardSoftDeletedMemoryIds(context.env, scope.entityType, scope.entityId);
+  const vectorIds = [...new Set([...confirmedIds, ...softDeletedIds])];
 
-  const deletedIds = await softDeleteDashboardMemories(context.env, scope.entityType, scope.entityId, candidates);
-  if (deletedIds.length === 0) return context.json({ removed: 0 });
-
-  await deleteVectors(context.env.VECTORIZE, deletedIds);
-  return context.json({ removed: deletedIds.length });
+  if (vectorIds.length > 0) await deleteVectors(context.env.VECTORIZE, vectorIds);
+  return context.json({ removed: confirmedIds.length });
 });
 
 dashboardRoutes.post('/api/search', async (context) => {

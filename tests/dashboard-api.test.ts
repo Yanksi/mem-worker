@@ -7,6 +7,7 @@ const dashboardService = vi.hoisted(() => ({
   listDashboardMemories: vi.fn(),
   getDashboardDeduplicationSummary: vi.fn(),
   listDashboardDuplicateMemoryIds: vi.fn(),
+  listDashboardSoftDeletedMemoryIds: vi.fn(),
   softDeleteDashboardMemories: vi.fn(),
 }));
 const vectorize = vi.hoisted(() => ({
@@ -121,6 +122,7 @@ describe('dashboard operator API', () => {
   it('deletes D1-confirmed agent duplicate vectors and only returns the removal count', async () => {
     dashboardService.listDashboardDuplicateMemoryIds.mockResolvedValue(['stale-memory', 'memory-2']);
     dashboardService.softDeleteDashboardMemories.mockResolvedValue(['memory-2']);
+    dashboardService.listDashboardSoftDeletedMemoryIds.mockResolvedValue(['memory-2', 'previously-deleted']);
     vectorize.deleteVectors.mockResolvedValue(undefined);
 
     const response = await worker.fetch(request('/dashboard/api/deduplication', {
@@ -133,7 +135,8 @@ describe('dashboard operator API', () => {
     await expect(response.json()).resolves.toEqual({ removed: 1 });
     expect(dashboardService.listDashboardDuplicateMemoryIds).toHaveBeenCalledWith(env, 'agent', 'hermes');
     expect(dashboardService.softDeleteDashboardMemories).toHaveBeenCalledWith(env, 'agent', 'hermes', ['stale-memory', 'memory-2']);
-    expect(vectorize.deleteVectors).toHaveBeenCalledWith(env.VECTORIZE, ['memory-2']);
+    expect(dashboardService.listDashboardSoftDeletedMemoryIds).toHaveBeenCalledWith(env, 'agent', 'hermes');
+    expect(vectorize.deleteVectors).toHaveBeenCalledWith(env.VECTORIZE, ['memory-2', 'previously-deleted']);
     expect(dashboardService.listDashboardDuplicateMemoryIds.mock.invocationCallOrder[0])
       .toBeLessThan(dashboardService.softDeleteDashboardMemories.mock.invocationCallOrder[0]);
     expect(dashboardService.softDeleteDashboardMemories.mock.invocationCallOrder[0])
@@ -146,6 +149,7 @@ describe('dashboard operator API', () => {
     dashboardService.softDeleteDashboardMemories.mockImplementation(() => new Promise<string[]>((resolve) => {
       resolveMemoryDeletion = resolve;
     }));
+    dashboardService.listDashboardSoftDeletedMemoryIds.mockResolvedValue([]);
     vectorize.deleteVectors.mockResolvedValue(undefined);
 
     const responsePromise = worker.fetch(request('/dashboard/api/deduplication', {
@@ -167,6 +171,7 @@ describe('dashboard operator API', () => {
   it('does not delete vectors when D1 confirms no duplicate deletions', async () => {
     dashboardService.listDashboardDuplicateMemoryIds.mockResolvedValue(['stale-memory']);
     dashboardService.softDeleteDashboardMemories.mockResolvedValue([]);
+    dashboardService.listDashboardSoftDeletedMemoryIds.mockResolvedValue([]);
 
     const response = await worker.fetch(request('/dashboard/api/deduplication', {
       method: 'POST',
@@ -180,8 +185,10 @@ describe('dashboard operator API', () => {
     expect(vectorize.deleteVectors).not.toHaveBeenCalled();
   });
 
-  it('does not delete when a user scope has no duplicate candidates', async () => {
+  it('checks soft-deleted IDs after a user scope has no duplicate candidates', async () => {
     dashboardService.listDashboardDuplicateMemoryIds.mockResolvedValue([]);
+    dashboardService.softDeleteDashboardMemories.mockResolvedValue([]);
+    dashboardService.listDashboardSoftDeletedMemoryIds.mockResolvedValue([]);
 
     const response = await worker.fetch(request('/dashboard/api/deduplication', {
       method: 'POST',
@@ -192,8 +199,28 @@ describe('dashboard operator API', () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ removed: 0 });
     expect(dashboardService.listDashboardDuplicateMemoryIds).toHaveBeenCalledWith(env, 'user', 'discord:42');
+    expect(dashboardService.softDeleteDashboardMemories).toHaveBeenCalledWith(env, 'user', 'discord:42', []);
+    expect(dashboardService.listDashboardSoftDeletedMemoryIds).toHaveBeenCalledWith(env, 'user', 'discord:42');
     expect(vectorize.deleteVectors).not.toHaveBeenCalled();
-    expect(dashboardService.softDeleteDashboardMemories).not.toHaveBeenCalled();
+  });
+
+  it('retries failed agent vector cleanup using scoped soft-deleted memory IDs', async () => {
+    dashboardService.listDashboardDuplicateMemoryIds.mockResolvedValue([]);
+    dashboardService.softDeleteDashboardMemories.mockResolvedValue([]);
+    dashboardService.listDashboardSoftDeletedMemoryIds.mockResolvedValue(['retry-memory']);
+    vectorize.deleteVectors.mockResolvedValue(undefined);
+
+    const response = await worker.fetch(request('/dashboard/api/deduplication', {
+      method: 'POST',
+      headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity_type: 'agent', entity_id: 'hermes', confirm: true }),
+    }), env);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ removed: 0 });
+    expect(dashboardService.softDeleteDashboardMemories).toHaveBeenCalledWith(env, 'agent', 'hermes', []);
+    expect(dashboardService.listDashboardSoftDeletedMemoryIds).toHaveBeenCalledWith(env, 'agent', 'hermes');
+    expect(vectorize.deleteVectors).toHaveBeenCalledWith(env.VECTORIZE, ['retry-memory']);
   });
 
   it('discovers users through the dashboard service', async () => {
