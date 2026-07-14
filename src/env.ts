@@ -9,12 +9,24 @@ export interface ExtractMemoryJob {
 export interface Mem0ImportJob {
   type: 'import-mem0-memory';
   requestId: string;
-  userId: string;
+  entityType?: 'user' | 'agent';
+  entityId?: string;
+  // Kept while jobs queued by pre-entity deployments drain safely.
+  userId?: string;
   item: RawMemoryMigrationItem;
   body?: never;
 }
 
-export type MemoryJob = ExtractMemoryJob | Mem0ImportJob;
+export interface ReclassifyMem0AgentJob {
+  type: 'reclassify-mem0-agent';
+  id: string;
+  sourceUserId: string;
+  agentId: string;
+  content: string;
+  metadataJson: string;
+}
+
+export type MemoryJob = ExtractMemoryJob | Mem0ImportJob | ReclassifyMem0AgentJob;
 
 export interface Env {
   DB: D1Database;

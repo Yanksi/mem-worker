@@ -1,5 +1,5 @@
 import type { Env, MemoryJob } from './env';
-import { isMem0ImportJob, processMem0ImportJob } from './import/service';
+import { isMem0ImportJob, isReclassifyMem0AgentJob, processMem0AgentReclassificationJob, processMem0ImportJob } from './import/service';
 import { processMemoryJob, TransientMemoryJobError } from './memory/service';
 import { AddMemoryRequestSchema } from './memory/types';
 
@@ -17,6 +17,20 @@ export async function handleMemoryQueue(batch: MessageBatch<MemoryJob>, env: Env
     if (isMem0ImportJob(message.body)) {
       try {
         await processMem0ImportJob(env, message.body);
+        message.ack();
+      } catch (error) {
+        if (isTransientQueueError(error)) {
+          message.retry();
+          return;
+        }
+        message.ack();
+      }
+      return;
+    }
+
+    if (isReclassifyMem0AgentJob(message.body)) {
+      try {
+        await processMem0AgentReclassificationJob(env, message.body);
         message.ack();
       } catch (error) {
         if (isTransientQueueError(error)) {

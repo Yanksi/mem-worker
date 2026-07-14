@@ -4,9 +4,11 @@ import { renderDashboard, renderDashboardLogin } from '../dashboard/page';
 import { listDashboardMemories, listDashboardUsers, setDashboardUserAlias } from '../dashboard/service';
 import type { Env } from '../env';
 import { listEntities, listRelationships } from '../graph/service';
-import { enqueueMem0Import } from '../import/service';
+import { enqueueMem0AgentReclassification, enqueueMem0Import } from '../import/service';
 import { DashboardMem0ImportRequest } from '../import/types';
 import { searchMemories } from '../memory/service';
+
+type DashboardEntityType = 'user' | 'agent';
 
 export const dashboardRoutes = new Hono<{ Bindings: Env }>();
 
@@ -56,20 +58,21 @@ dashboardRoutes.put('/api/users/:userId/alias', async (context) => {
 });
 
 dashboardRoutes.get('/api/memories', async (context) => {
-  const userId = context.req.query('user_id');
-  if (userId === undefined || userId.trim() === '') return context.json({ error: 'Validation failed' }, 400);
+  const scope = dashboardScope(context.req.query('entity_type'), context.req.query('entity_id'), context.req.query('user_id'));
+  if (scope === undefined) return context.json({ error: 'Validation failed' }, 400);
   const requestedOffset = Number(context.req.query('offset') ?? '0');
   const offset = Number.isInteger(requestedOffset) && requestedOffset >= 0 ? requestedOffset : 0;
-  return context.json(await listDashboardMemories(context.env, userId, offset));
+  return context.json(await listDashboardMemories(context.env, scope.entityType, scope.entityId, offset));
 });
 
 dashboardRoutes.post('/api/search', async (context) => {
-  const body = await context.req.json<{ user_id?: unknown; query?: unknown }>().catch(() => null);
-  if (body === null || typeof body.user_id !== 'string' || body.user_id.trim() === '' || typeof body.query !== 'string') {
+  const body = await context.req.json<{ entity_type?: unknown; entity_id?: unknown; user_id?: unknown; query?: unknown }>().catch(() => null);
+  const scope = body === null ? undefined : dashboardScope(body.entity_type, body.entity_id, body.user_id);
+  if (scope === undefined || typeof body?.query !== 'string') {
     return context.json({ error: 'Validation failed' }, 400);
   }
   return context.json({ results: await searchMemories(context.env, {
-    user_id: body.user_id,
+    ...(scope.entityType === 'user' ? { user_id: scope.entityId } : { agent_id: scope.entityId }),
     query: body.query,
     limit: 10,
     filters: {},
@@ -81,16 +84,30 @@ dashboardRoutes.post('/api/imports/mem0', async (context) => {
   const parsed = DashboardMem0ImportRequest.safeParse(body);
   if (!parsed.success) return context.json({ error: 'Validation failed' }, 400);
 
-  const queued = await enqueueMem0Import(context.env, parsed.data.user_id, parsed.data.export);
+  const queued = await enqueueMem0Import(context.env, {
+    entityType: parsed.data.entity_type,
+    entityId: parsed.data.entity_id,
+  }, parsed.data.export);
+  return context.json({ queued }, 202);
+});
+
+dashboardRoutes.post('/api/entities/reclassify-agent', async (context) => {
+  const body = await context.req.json<{ source_user_id?: unknown; agent_id?: unknown }>().catch(() => null);
+  const sourceUserId = typeof body?.source_user_id === 'string' ? body.source_user_id : context.req.query('source_user_id');
+  const agentId = typeof body?.agent_id === 'string' ? body.agent_id : context.req.query('agent_id');
+  if (sourceUserId === undefined || sourceUserId.trim() === '' || agentId === undefined || agentId.trim() === '') {
+    return context.json({ error: 'Validation failed' }, 400);
+  }
+  const queued = await enqueueMem0AgentReclassification(context.env, sourceUserId, agentId);
   return context.json({ queued }, 202);
 });
 
 dashboardRoutes.get('/api/graph', async (context) => {
-  const userId = context.req.query('user_id');
-  if (userId === undefined || userId.trim() === '') return context.json({ error: 'Validation failed' }, 400);
+  const scope = dashboardScope(context.req.query('entity_type'), context.req.query('entity_id'), context.req.query('user_id'));
+  if (scope === undefined || scope.entityType !== 'user') return context.json({ error: 'Memory graphs are available for user entities only' }, 400);
   const [entities, relationships] = await Promise.all([
-    listEntities(context.env, userId),
-    listRelationships(context.env, userId),
+    listEntities(context.env, scope.entityId),
+    listRelationships(context.env, scope.entityId),
   ]);
   return context.json({ entities, relationships });
 });
@@ -99,6 +116,14 @@ async function createDashboardSessionCookie(password: string): Promise<string> {
   const expiresAt = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
   const signature = await signSessionExpiry(expiresAt, password);
   return `${SESSION_COOKIE_NAME}=${expiresAt}.${signature}; Max-Age=${SESSION_TTL_SECONDS}; Path=/; HttpOnly; Secure; SameSite=Strict`;
+}
+
+function dashboardScope(entityType: unknown, entityId: unknown, legacyUserId: unknown): { entityType: DashboardEntityType; entityId: string } | undefined {
+  if ((entityType === 'user' || entityType === 'agent') && typeof entityId === 'string' && entityId.trim() !== '') {
+    return { entityType, entityId };
+  }
+  if (typeof legacyUserId === 'string' && legacyUserId.trim() !== '') return { entityType: 'user', entityId: legacyUserId };
+  return undefined;
 }
 
 async function hasValidDashboardSession(cookieHeader: string | undefined, password: string): Promise<boolean> {

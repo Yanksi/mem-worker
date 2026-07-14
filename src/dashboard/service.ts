@@ -3,8 +3,11 @@ import type { MemoryResponse } from '../memory/types';
 
 const PAGE_SIZE = 50;
 
-export interface DashboardUser {
-  user_id: string;
+export type DashboardEntityType = 'user' | 'agent';
+
+export interface DashboardEntity {
+  entity_type: DashboardEntityType;
+  entity_id: string;
   alias?: string;
   memory_count: number;
 }
@@ -14,22 +17,26 @@ export interface DashboardMemoryPage {
   next_offset?: number;
 }
 
-export async function listDashboardUsers(env: Env): Promise<DashboardUser[]> {
+export async function listDashboardUsers(env: Env): Promise<DashboardEntity[]> {
   const query = `
-    WITH user_ids AS (
-      SELECT DISTINCT user_id FROM memories WHERE deleted_at IS NULL
-      UNION SELECT DISTINCT user_id FROM entities
-      UNION SELECT user_id FROM user_aliases
+    WITH scopes AS (
+      SELECT DISTINCT 'user' AS entity_type, user_id AS entity_id FROM memories WHERE deleted_at IS NULL AND user_id IS NOT NULL
+      UNION SELECT DISTINCT 'agent' AS entity_type, agent_id AS entity_id FROM memories WHERE deleted_at IS NULL AND agent_id IS NOT NULL
+      UNION SELECT DISTINCT 'user' AS entity_type, user_id AS entity_id FROM entities
+      UNION SELECT 'user' AS entity_type, user_id AS entity_id FROM user_aliases
     )
-    SELECT user_ids.user_id, user_aliases.alias,
-      (SELECT COUNT(*) FROM memories WHERE memories.user_id = user_ids.user_id AND deleted_at IS NULL) AS memory_count
-    FROM user_ids
-    LEFT JOIN user_aliases ON user_aliases.user_id = user_ids.user_id
-    ORDER BY COALESCE(user_aliases.alias, user_ids.user_id) COLLATE NOCASE
+    SELECT scopes.entity_type, scopes.entity_id, user_aliases.alias,
+      (SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL AND
+        ((scopes.entity_type = 'user' AND memories.user_id = scopes.entity_id) OR
+         (scopes.entity_type = 'agent' AND memories.agent_id = scopes.entity_id))) AS memory_count
+    FROM scopes
+    LEFT JOIN user_aliases ON user_aliases.user_id = scopes.entity_id
+    ORDER BY scopes.entity_type, COALESCE(user_aliases.alias, scopes.entity_id) COLLATE NOCASE
   `;
-  const result = await env.DB.prepare(query).all<{ user_id: string; alias: string | null; memory_count: number }>();
+  const result = await env.DB.prepare(query).all<{ entity_type: DashboardEntityType; entity_id: string; alias: string | null; memory_count: number }>();
   return result.results.map((row) => ({
-    user_id: row.user_id,
+    entity_type: row.entity_type,
+    entity_id: row.entity_id,
     ...(row.alias === null ? {} : { alias: row.alias }),
     memory_count: row.memory_count,
   }));
@@ -48,14 +55,15 @@ export async function setDashboardUserAlias(env: Env, userId: string, alias: str
   `).bind(userId, normalized).run();
 }
 
-export async function listDashboardMemories(env: Env, userId: string, offset: number): Promise<DashboardMemoryPage> {
+export async function listDashboardMemories(env: Env, entityType: DashboardEntityType, entityId: string, offset: number): Promise<DashboardMemoryPage> {
+  const column = entityType === 'user' ? 'user_id' : 'agent_id';
   const result = await env.DB.prepare(`
     SELECT id, user_id, agent_id, run_id, actor_id, content, metadata_json, created_at, updated_at
     FROM memories
-    WHERE user_id = ? AND deleted_at IS NULL
+    WHERE ${column} = ? AND deleted_at IS NULL
     ORDER BY created_at DESC, id DESC
     LIMIT ? OFFSET ?
-  `).bind(userId, PAGE_SIZE + 1, offset).all<MemoryRow>();
+  `).bind(entityId, PAGE_SIZE + 1, offset).all<MemoryRow>();
   const rows = result.results.slice(0, PAGE_SIZE);
   return {
     results: rows.map(toMemoryResponse),
@@ -65,7 +73,7 @@ export async function listDashboardMemories(env: Env, userId: string, offset: nu
 
 interface MemoryRow {
   id: string;
-  user_id: string;
+  user_id: string | null;
   agent_id: string | null;
   run_id: string | null;
   actor_id: string | null;
@@ -79,7 +87,7 @@ function toMemoryResponse(row: MemoryRow): MemoryResponse {
   return {
     id: row.id,
     memory: row.content,
-    user_id: row.user_id,
+    ...(row.user_id === null ? {} : { user_id: row.user_id }),
     ...(row.agent_id === null ? {} : { agent_id: row.agent_id }),
     ...(row.run_id === null ? {} : { run_id: row.run_id }),
     ...(row.actor_id === null ? {} : { actor_id: row.actor_id }),

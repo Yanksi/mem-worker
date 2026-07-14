@@ -16,9 +16,15 @@ export const RawMemoryMigrationExport = z.object({
 });
 
 export const DashboardMem0ImportRequest = z.object({
-  user_id: z.string().trim().min(1),
+  entity_type: z.enum(['user', 'agent']),
+  entity_id: z.string().trim().min(1),
   export: RawMemoryMigrationExport,
 });
+
+export type DashboardEntityScope = {
+  entityType: 'user' | 'agent';
+  entityId: string;
+};
 
 export type RawMemoryMigrationItem = z.infer<typeof RawMemoryMigrationItem>;
 export type RawMemoryMigrationExport = z.infer<typeof RawMemoryMigrationExport>;

@@ -7,6 +7,8 @@ import initialMigration from '../src/migrations/0001_initial.sql?raw';
 import idempotencyRequestsMigration from '../src/migrations/0002_idempotency_requests.sql?raw';
 // @ts-expect-error -- this scaffold does not include Vite's client asset declarations.
 import memoryRequestLeasesMigration from '../src/migrations/0003_memory_request_leases.sql?raw';
+// @ts-expect-error -- this scaffold does not include Vite's client asset declarations.
+import agentScopedMemoriesMigration from '../src/migrations/0004_agent_scoped_memories.sql?raw';
 import {
   apiKeys,
   entities,
@@ -118,5 +120,14 @@ describe('database schema', () => {
     expect(memoryRequestLeasesMigration).toContain(
       'ALTER TABLE memory_requests ADD COLUMN candidates_json TEXT;',
     );
+  });
+
+  it('makes memory user ownership nullable for agent-only records', () => {
+    expect(memories.userId.notNull).toBe(false);
+    expect(agentScopedMemoriesMigration).toContain('PRAGMA defer_foreign_keys = on;');
+    expect(agentScopedMemoriesMigration).toContain('user_id TEXT,');
+    expect(agentScopedMemoriesMigration).toContain('CREATE TABLE memory_history_rebuild');
+    expect(agentScopedMemoriesMigration).toContain('CREATE TABLE relationships_rebuild');
+    expect(agentScopedMemoriesMigration).toContain('CREATE TABLE memory_entity_links_rebuild');
   });
 });

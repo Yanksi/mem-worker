@@ -15,6 +15,7 @@ const memoryService = vi.hoisted(() => ({
 }));
 const importService = vi.hoisted(() => ({
   enqueueMem0Import: vi.fn(),
+  enqueueMem0AgentReclassification: vi.fn(),
 }));
 
 vi.mock('../src/dashboard/service', () => dashboardService);
@@ -90,7 +91,7 @@ describe('dashboard operator API', () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ results: [{ id: 'memory-1' }], next_offset: 50 });
-    expect(dashboardService.listDashboardMemories).toHaveBeenCalledWith(env, 'discord:42', 50);
+    expect(dashboardService.listDashboardMemories).toHaveBeenCalledWith(env, 'user', 'discord:42', 50);
   });
 
   it('searches and loads a graph for the selected user', async () => {
@@ -132,12 +133,40 @@ describe('dashboard operator API', () => {
     const response = await worker.fetch(request('/dashboard/api/imports/mem0', {
       method: 'POST',
       headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_id: 'discord:42', export: exportPayload }),
+      body: JSON.stringify({ entity_type: 'user', entity_id: 'discord:42', export: exportPayload }),
     }), env);
 
     expect(response.status).toBe(202);
     await expect(response.json()).resolves.toEqual({ queued: 2 });
-    expect(importService.enqueueMem0Import).toHaveBeenCalledWith(env, 'discord:42', exportPayload);
+    expect(importService.enqueueMem0Import).toHaveBeenCalledWith(env, { entityType: 'user', entityId: 'discord:42' }, exportPayload);
+  });
+
+  it('accepts an agent-scoped Mem0 import', async () => {
+    importService.enqueueMem0Import.mockResolvedValue(1);
+    const exportPayload = { memories: [{ memory: 'Hermes is an agent.' }] };
+
+    const response = await worker.fetch(request('/dashboard/api/imports/mem0', {
+      method: 'POST',
+      headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity_type: 'agent', entity_id: 'hermes', export: exportPayload }),
+    }), env);
+
+    expect(response.status).toBe(202);
+    expect(importService.enqueueMem0Import).toHaveBeenCalledWith(env, {
+      entityType: 'agent', entityId: 'hermes',
+    }, exportPayload);
+  });
+
+  it('queues an authenticated agent reclassification from query parameters', async () => {
+    importService.enqueueMem0AgentReclassification.mockResolvedValue(129);
+
+    const response = await worker.fetch(request('/dashboard/api/entities/reclassify-agent?source_user_id=hermes&agent_id=hermes', {
+      method: 'POST', headers: { Cookie: await dashboardCookie() },
+    }), env);
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ queued: 129 });
+    expect(importService.enqueueMem0AgentReclassification).toHaveBeenCalledWith(env, 'hermes', 'hermes');
   });
 
   it('rejects malformed Mem0 imports before queueing', async () => {

@@ -22,12 +22,14 @@ export const AddMemoryRequestSchema = z.object({
 
 export const SearchMemoryRequestSchema = z.object({
   query: z.string(),
-  user_id: z.string(),
-  agent_id: z.string().optional(),
+  user_id: nonEmptyString.optional(),
+  agent_id: nonEmptyString.optional(),
   run_id: z.string().optional(),
   actor_id: z.string().optional(),
   limit: z.number().int().positive().max(50).default(10),
   filters: record.default({}),
+}).refine((request) => request.user_id !== undefined || request.agent_id !== undefined, {
+  message: 'Either user_id or agent_id is required',
 });
 
 export const UpdateMemoryRequestSchema = z.object({
@@ -40,7 +42,7 @@ export const UpdateMemoryRequestSchema = z.object({
 export const MemoryResponseSchema = z.object({
   id: z.string(),
   memory: z.string(),
-  user_id: z.string(),
+  user_id: z.string().optional(),
   agent_id: z.string().optional(),
   run_id: z.string().optional(),
   actor_id: z.string().optional(),

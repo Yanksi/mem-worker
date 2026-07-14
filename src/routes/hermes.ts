@@ -44,6 +44,7 @@ hermesRoutes.put('/memories/:id', async (context) => {
   if (request instanceof Response) return request;
   const memory = await getMemoryById(context.env, context.req.param('id'));
   if (memory === null) return notFound(context);
+  if (memory.user_id === undefined) return context.json({ error: 'Memory is not user-scoped' }, 409);
   const updated = await updateMemory(context.env, memory.id, memory.user_id, { memory: request.text });
   return updated === null ? notFound(context) : context.json(updated);
 });
@@ -51,6 +52,7 @@ hermesRoutes.put('/memories/:id', async (context) => {
 hermesRoutes.delete('/memories/:id', async (context) => {
   const memory = await getMemoryById(context.env, context.req.param('id'));
   if (memory === null) return notFound(context);
+  if (memory.user_id === undefined) return context.json({ error: 'Memory is not user-scoped' }, 409);
   const deleted = await deleteMemory(context.env, memory.id, memory.user_id);
   return deleted ? context.json({ deleted: true }) : notFound(context);
 });

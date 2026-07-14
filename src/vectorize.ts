@@ -22,7 +22,7 @@ export async function searchVectors(
   validateMetadataFilter(request.filters, false);
   const filter = {
     ...request.filters,
-    user_id: request.user_id,
+    ...(request.user_id === undefined ? {} : { user_id: request.user_id }),
     ...(request.agent_id === undefined ? {} : { agent_id: request.agent_id }),
     ...(request.run_id === undefined ? {} : { run_id: request.run_id }),
     ...(request.actor_id === undefined ? {} : { actor_id: request.actor_id }),

@@ -17,7 +17,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - Durable tenant-scoped idempotency records, retry-safe deterministic writes, and a Queue consumer for asynchronous ingestion.
 - Extracted entity and relationship persistence, plus read-only graph endpoints.
 - API-key authentication, per-user memory and graph isolation, and a signed-session operator dashboard with automatic user discovery.
-- Dashboard views for semantic search, paginated active-memory browsing, a bounded entity/relationship graph, and dashboard-managed user-ID aliases.
+- Dashboard views for semantic search and paginated active-memory browsing across discovered user and agent entities, a bounded user entity/relationship graph, and dashboard-managed user-ID aliases.
 - D1 migrations, local test coverage, Wrangler configuration, and a deployment guide.
 
 ## Not Included
@@ -25,7 +25,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - The Python Mem0 runtime, SDKs, or full API and behavioral compatibility.
 - Hosted Mem0 Platform features such as organizations, billing, advanced user management, and hosted-dashboard parity.
 - Alternative vector stores, graph databases, or the broad LLM/embedder provider matrix from Mem0 OSS.
-- A Neo4j-style graph engine, unbounded graph traversal, or advanced graph analytics; graph support is bounded D1-backed storage and reads.
+- A Neo4j-style graph engine, unbounded graph traversal, advanced graph analytics, or agent-scoped graphs; graph support is bounded D1-backed storage and reads for user-scoped memories.
 - Automatic Cloudflare resource provisioning or secret creation. Deployment requires creating the D1 database, Vectorize index, Queue, metadata indexes, and secrets described below.
 - A general-purpose job-status API or dashboard job monitor beyond the durable ingestion behavior used internally by async memory requests.
 - Dashboard memory editing, deletion, bulk exports, graph editing, or graph traversal beyond the bounded read-only graph view. The dashboard can only create, change, or remove display aliases for stored user IDs.
@@ -83,19 +83,19 @@ The request is idempotent; use `request_id` when the caller needs a stable calle
 
 ## Dashboard
 
-Open `$MEM0_URL/dashboard` and sign in with `DASHBOARD_PASSWORD`. The dashboard discovers user IDs from active memories, stored graph entities, and any previously saved aliases. It never uses the service API key in the browser.
+Open `$MEM0_URL/dashboard` and sign in with `DASHBOARD_PASSWORD`. The dashboard discovers user and agent entities from active memories, plus user IDs from stored graph entities and saved aliases. It never uses the service API key in the browser.
 
 Use the **User profile** selector to scope the three views:
 
 - **Search memory** performs semantic recall for the selected user.
 - **All memories** displays that user's active memories, newest first, with pagination and a detail inspector.
-- **Memory graph** displays that user's stored entities and relationships as a bounded interactive graph.
+- **Memory graph** displays a selected user's stored entities and relationships as a bounded interactive graph. Agent entities remain searchable and browsable, but do not have graph support in this implementation.
 
 The adjacent **Edit** control saves a dashboard-managed alias in D1. Once set, the selector displays the alias rather than the raw user ID; aliases do not alter API ownership, Hermes identities, or stored memory data. Apply the latest D1 migration after upgrading to create the alias table.
 
 ### Import from Mem0
 
-The dashboard's **Import from Mem0** view accepts the same `RawMemoryMigrationExport` source either by selecting a `.json` file or by pasting JSON into the textarea. Selecting a `.json` file loads its contents into that textarea. Its filename base becomes the target user ID until the target-user-ID field is manually edited; a manual value is never replaced by later file selections.
+The dashboard's **Import from Mem0** view accepts the same `RawMemoryMigrationExport` source either by selecting a `.json` file or by pasting JSON into the textarea. Choose whether the target is a **User** or an **Agent** before queueing it. Selecting a `.json` file loads its contents into that textarea. Its filename base becomes the target entity ID until the target-ID field is manually edited; a manual value is never replaced by later file selections.
 
 The accepted export is exactly this JSON Schema:
 
@@ -122,7 +122,7 @@ The accepted export is exactly this JSON Schema:
 }
 ```
 
-Submitting posts `{ "user_id": "...", "export": { ... } }` to the signed-session dashboard endpoint `/dashboard/api/imports/mem0`. It returns a queued count and processing continues asynchronously through Cloudflare Queues. Each source `memory` is stored as exact text with valid source timestamps preserved (missing timestamps use import time); import processing embeds the text directly, is retry-idempotent, and performs no LLM extraction or graph inference.
+Submitting posts `{ "entity_type": "user" | "agent", "entity_id": "...", "export": { ... } }` to the signed-session dashboard endpoint `/dashboard/api/imports/mem0`. It returns a queued count and processing continues asynchronously through Cloudflare Queues. Each source `memory` is stored as exact text with valid source timestamps preserved (missing timestamps use import time); import processing embeds the text directly, is retry-idempotent, and performs no LLM extraction or graph inference.
 
 ### Add a memory
 

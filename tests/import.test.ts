@@ -62,18 +62,34 @@ describe('Mem0 migration imports', () => {
     const send = vi.fn().mockResolvedValue(undefined);
     const exportPayload = { memories: [exportedMemory, { ...exportedMemory, memory: 'User works in Zurich.' }] };
 
-    await expect(enqueueMem0Import({ ...env, MEMORY_JOBS: { send } } as unknown as Env, 'user-123', exportPayload))
+    await expect(enqueueMem0Import({ ...env, MEMORY_JOBS: { send } } as unknown as Env, { entityType: 'user', entityId: 'user-123' }, exportPayload))
       .resolves.toBe(2);
     const firstPass = send.mock.calls.map(([job]) => job);
 
     send.mockClear();
-    await enqueueMem0Import({ ...env, MEMORY_JOBS: { send } } as unknown as Env, 'user-123', exportPayload);
+    await enqueueMem0Import({ ...env, MEMORY_JOBS: { send } } as unknown as Env, { entityType: 'user', entityId: 'user-123' }, exportPayload);
 
     expect(send).toHaveBeenCalledTimes(2);
     expect(firstPass).toEqual(send.mock.calls.map(([job]) => job));
     expect(firstPass).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'import-mem0-memory', userId: 'user-123', item: exportedMemory }),
+      expect.objectContaining({ type: 'import-mem0-memory', entityType: 'user', entityId: 'user-123', item: exportedMemory }),
     ]));
+  });
+
+  it('enqueues agent imports with an agent-only owner', async () => {
+    const send = vi.fn().mockResolvedValue(undefined);
+
+    await enqueueMem0Import(
+      { ...env, MEMORY_JOBS: { send } } as unknown as Env,
+      { entityType: 'agent', entityId: 'hermes' },
+      { memories: [exportedMemory] },
+    );
+
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'import-mem0-memory',
+      entityType: 'agent',
+      entityId: 'hermes',
+    }));
   });
 
   it('directly embeds and stores the exact imported text with source timestamps', async () => {
@@ -111,6 +127,29 @@ describe('Mem0 migration imports', () => {
         content: exportedMemory.memory,
       }) }),
     ]));
+  });
+
+  it('stores an agent import without a user ID and indexes it as an agent', async () => {
+    const db = importDb();
+    dependencies.createDb.mockReturnValue(db);
+    dependencies.embedText.mockResolvedValue([0.1, 0.2]);
+    dependencies.upsertVectors.mockResolvedValue(undefined);
+
+    await processMem0ImportJob(env, {
+      type: 'import-mem0-memory',
+      requestId: 'agent-memory-id',
+      entityType: 'agent',
+      entityId: 'hermes',
+      item: exportedMemory,
+    });
+
+    expect(db.insertedValues).toContainEqual(expect.objectContaining({
+      table: memories,
+      values: expect.objectContaining({ userId: null, agentId: 'hermes' }),
+    }));
+    expect(dependencies.upsertVectors).toHaveBeenCalledWith(env.VECTORIZE, [expect.objectContaining({
+      metadata: expect.objectContaining({ agent_id: 'hermes' }),
+    })]);
   });
 
   it('routes an import queue job through direct import processing and acknowledges it', async () => {

@@ -45,7 +45,7 @@ describe('GET /dashboard', () => {
     const html = await response.text();
 
     expect(html).toContain('<title>Mem0 Edge Dashboard</title>');
-    expect(html).toContain('name="user_id"');
+    expect(html).toContain('name="entity_id"');
     expect(html).toContain('name="query"');
     expect(html).toContain('type="submit"');
     expect(html).toContain('/dashboard/api/search');
@@ -89,6 +89,7 @@ describe('GET /dashboard', () => {
     const html = await response.text();
 
     expect(html).toContain('data-view="import"');
+    expect(html).toContain('name="target_entity_type"');
     expect(html).toContain('name="target_user_id"');
     expect(html).toContain('name="export_json"');
     expect(html).toContain('RawMemoryMigrationExport');

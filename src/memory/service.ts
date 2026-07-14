@@ -33,11 +33,11 @@ export class TransientMemoryJobError extends Error {
 }
 
 export async function processMemoryJob(env: Env, job: MemoryJob): Promise<ProcessMemoryJobResult> {
-  const parsed = AddMemoryRequestSchema.safeParse(job.body);
-  if (!parsed.success) throw parsed.error;
   if (job.type !== 'extract-and-store' || !job.requestId.trim()) {
     throw new Error('Invalid memory job');
   }
+  const parsed = AddMemoryRequestSchema.safeParse(job.body);
+  if (!parsed.success) throw parsed.error;
   if (parsed.data.request_id !== undefined && parsed.data.request_id !== job.requestId) {
     throw new Error('Memory job request ID does not match its body');
   }
@@ -359,6 +359,7 @@ async function candidatesForLease(db: ReturnType<typeof createDb>, env: Env, req
 }
 
 async function persistExtractedGraph(db: ReturnType<typeof createDb>, memory: MemoryRow, extracted: ExtractedMemory): Promise<void> {
+  if (memory.userId === null) return;
   const byName = new Map<string, { id: string; name: string; type: string }>();
   for (const entity of extracted.entities ?? []) {
     const resolved = await persistEntity(db, memory.userId, entity.name, entity.type, entity.summary);
@@ -477,7 +478,7 @@ export async function searchMemories(env: Env, request: SearchMemoryRequest): Pr
 
   const rows = await createDb(env.DB).select().from(memories).where(and(
     inArray(memories.id, matches.map(({ id }) => id)),
-    eq(memories.userId, request.user_id),
+    ...(request.user_id === undefined ? [eq(memories.agentId, request.agent_id!)] : [eq(memories.userId, request.user_id)]),
     isNull(memories.deletedAt),
   )).all();
   const byId = new Map(rows.map((row) => [row.id, row]));
@@ -578,7 +579,7 @@ function deterministicCreatedHistoryId(memoryId: string): Promise<string> {
 function vectorMetadata(row: Pick<MemoryRow, 'userId' | 'agentId' | 'runId' | 'actorId' | 'metadataJson'>): Record<string, VectorizeVectorMetadataValue> {
   return {
     ...scalarMetadata(row.metadataJson),
-    user_id: row.userId,
+    ...(row.userId === null ? {} : { user_id: row.userId }),
     ...(row.agentId === null ? {} : { agent_id: row.agentId }),
     ...(row.runId === null ? {} : { run_id: row.runId }),
     ...(row.actorId === null ? {} : { actor_id: row.actorId }),
@@ -595,7 +596,7 @@ function toResponse(row: MemoryRow): MemoryResponse {
   return {
     id: row.id,
     memory: row.content,
-    user_id: row.userId,
+    ...(row.userId === null ? {} : { user_id: row.userId }),
     ...(row.agentId === null ? {} : { agent_id: row.agentId }),
     ...(row.runId === null ? {} : { run_id: row.runId }),
     ...(row.actorId === null ? {} : { actor_id: row.actorId }),

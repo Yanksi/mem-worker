@@ -31,7 +31,7 @@ export const memories = sqliteTable(
   'memories',
   {
     id: text('id').primaryKey(),
-    userId: text('user_id').notNull(),
+    userId: text('user_id'),
     agentId: text('agent_id'),
     runId: text('run_id'),
     actorId: text('actor_id'),
