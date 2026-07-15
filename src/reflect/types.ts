@@ -74,7 +74,7 @@ export const GraphReflectionInputSchema = z.object({
 
 export const GraphReflectionResultSchema = z.object({
   result: NonEmptyString.max(4000),
-  evidence_relation_refs: z.array(GraphRelationRefSchema).min(1).max(32)
+  evidence_relation_refs: z.array(GraphRelationRefSchema).max(32)
     .refine((refs) => new Set(refs).size === refs.length, 'Relation references must be unique'),
 }).strict();
 
