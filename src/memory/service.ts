@@ -6,7 +6,9 @@ import type { Env, MemoryJob } from '../env';
 import { embedText, extractMemories } from '../llm';
 import type { ExtractedEntity, ExtractedMemory, ExtractedRelationship } from '../llm';
 import { deleteVector, searchEntityVectors, searchVectors, upsertEntityVectors, upsertVectors } from '../vectorize';
+import { findActiveExactMemory, prepareMemoryWrite } from './deduplication';
 import { buildIdempotencyKey, sha256Hex } from './idempotency';
+import { contentHash, memoryVectorMetadata } from './identity';
 import { AddMemoryRequestSchema, MemoryResponseSchema } from './types';
 import type {
   AddMemoryRequest,
@@ -19,7 +21,7 @@ type MemoryRow = typeof memories.$inferSelect;
 type MemoryRequestRow = typeof memoryRequests.$inferSelect;
 export type AddMemoryResult = MemoryResponse[] | { request_id: string; status: 'queued' };
 export type ProcessMemoryJobResult = 'processed' | 'noop' | 'inflight';
-type LedgerClaim = { leaseToken: number; candidatesJson: string | null };
+type LedgerClaim = { leaseToken: number; candidatesJson: string | null; cleanupVectorIdsJson: string | null };
 type LeaseClaim = LedgerClaim;
 type MemoryCandidate = { content: string; extracted?: ExtractedMemory };
 
@@ -30,6 +32,13 @@ export class TransientMemoryJobError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = 'TransientMemoryJobError';
+  }
+}
+
+export class MemoryContentConflictError extends Error {
+  constructor() {
+    super('An active memory with this content already exists');
+    this.name = 'MemoryContentConflictError';
   }
 }
 
@@ -104,7 +113,11 @@ async function claimMemoryRequest(
       eq(memoryRequests.idempotencyKey, requestId),
       inArray(memoryRequests.status, statuses),
       ...(staleBefore === undefined ? [] : [lt(memoryRequests.updatedAt, staleBefore)]),
-    )).returning({ leaseToken: memoryRequests.leaseToken, candidatesJson: memoryRequests.candidatesJson }).all();
+    )).returning({
+      leaseToken: memoryRequests.leaseToken,
+      candidatesJson: memoryRequests.candidatesJson,
+      cleanupVectorIdsJson: memoryRequests.cleanupVectorIdsJson,
+    }).all();
   return rows[0];
 }
 
@@ -137,6 +150,7 @@ export async function addMemory(env: Env, request: AddMemoryRequest): Promise<Ad
     completedAt: null,
     leaseToken: request.async ? 0 : 1,
     candidatesJson: null,
+    cleanupVectorIdsJson: null,
   }).onConflictDoNothing().returning({ idempotencyKey: memoryRequests.idempotencyKey }).all();
 
   if (claim.length === 0) {
@@ -145,7 +159,17 @@ export async function addMemory(env: Env, request: AddMemoryRequest): Promise<Ad
       eq(memoryRequests.idempotencyKey, hash),
     )).get();
     const existingResult = await resolveExistingRequest(db, existing, request, hash);
-    if (isLeaseClaim(existingResult)) return processClaimedMemoryRequest(db, env, request, hash, existingResult.leaseToken, existingResult.candidatesJson);
+    if (isLeaseClaim(existingResult)) {
+      return processClaimedMemoryRequest(
+        db,
+        env,
+        request,
+        hash,
+        existingResult.leaseToken,
+        existingResult.candidatesJson,
+        existingResult.cleanupVectorIdsJson,
+      );
+    }
     if (existingResult !== undefined) return existingResult;
 
     // Older deployments may have memory rows that predate the request ledger.
@@ -154,7 +178,7 @@ export async function addMemory(env: Env, request: AddMemoryRequest): Promise<Ad
     throw new Error('Unable to resolve existing memory request');
   }
 
-  return processClaimedMemoryRequest(db, env, request, hash, request.async ? 0 : 1);
+  return processClaimedMemoryRequest(db, env, request, hash, request.async ? 0 : 1, null, null);
 }
 
 async function processClaimedMemoryRequest(
@@ -164,6 +188,7 @@ async function processClaimedMemoryRequest(
   hash: string,
   leaseToken: number,
   candidatesJson: string | null = null,
+  cleanupVectorIdsJson: string | null = null,
 ): Promise<AddMemoryResult> {
   if (request.async) {
     const job: MemoryJob = { type: 'extract-and-store', requestId: hash, body: request };
@@ -177,7 +202,7 @@ async function processClaimedMemoryRequest(
   }
 
   try {
-    const responses = await createMemoriesForLease(db, env, request, hash, { leaseToken, candidatesJson });
+    const responses = await createMemoriesForLease(db, env, request, hash, { leaseToken, candidatesJson, cleanupVectorIdsJson });
     if (responses === undefined) throw new Error('Memory request lease was replaced');
     await completeRequest(db, request.user_id, hash, leaseToken, responses);
     return responses;
@@ -225,7 +250,11 @@ async function resolveExistingRequest(
     eq(memoryRequests.userId, request.user_id),
     eq(memoryRequests.idempotencyKey, hash),
     eq(memoryRequests.status, 'failed'),
-  )).returning({ leaseToken: memoryRequests.leaseToken, candidatesJson: memoryRequests.candidatesJson }).all();
+  )).returning({
+    leaseToken: memoryRequests.leaseToken,
+    candidatesJson: memoryRequests.candidatesJson,
+    cleanupVectorIdsJson: memoryRequests.cleanupVectorIdsJson,
+  }).all();
 
   if (retry.length > 0) return retry[0];
 
@@ -273,14 +302,32 @@ async function createMemoriesForLease(
   hash: string,
   claim: LedgerClaim,
 ): Promise<MemoryResponse[] | undefined> {
+  await cleanupPendingRequestVectors(db, env, request.user_id, hash, claim);
   const candidates = await candidatesForLease(db, env, request, hash, claim);
   if (candidates === undefined) return undefined;
   const now = unixNow();
   const responses: MemoryResponse[] = [];
+  const scope = { userId: request.user_id, agentId: request.agent_id ?? null };
 
   for (const [candidateIndex, candidate] of candidates.entries()) {
     const { content } = candidate;
     const id = await deterministicMemoryId(request.user_id, hash, candidateIndex);
+
+    if (claim.candidatesJson !== null) {
+      const own = await findActiveMemoryById(db, id);
+      if (own !== undefined) {
+        await repairCreatedMemory(db, env, own, candidate);
+        responses.push(toResponse(own));
+        continue;
+      }
+    }
+
+    const prepared = await prepareMemoryWrite(env, scope, content);
+    if (prepared.duplicate !== undefined) {
+      responses.push(toResponse(prepared.duplicate));
+      continue;
+    }
+
     const metadataJson = JSON.stringify(request.metadata);
     const row = {
       id,
@@ -291,20 +338,106 @@ async function createMemoriesForLease(
       content,
       metadataJson,
       hash,
-      contentHash: null,
+      contentHash: prepared.contentHash,
       createdAt: now,
       updatedAt: now,
       deletedAt: null,
     };
-    const vector = await embedText(env, content);
-    await upsertVectors(env.VECTORIZE, [{ id, values: vector, metadata: vectorMetadata(row) }]);
-    await db.insert(memories).values(row).onConflictDoNothing().run();
-    await appendHistory(db, row, 'created', await deterministicCreatedHistoryId(id));
-    if (candidate.extracted !== undefined) await persistExtractedGraph(db, env, row, candidate.extracted);
-    responses.push(toResponse(row));
+    const vector = prepared.embedding ?? await embedText(env, content);
+    await upsertVectors(env.VECTORIZE, [{ id, values: vector, metadata: await memoryVectorMetadata(row) }]);
+    const inserted = await db.insert(memories).values(row).onConflictDoNothing().returning().get();
+    if (inserted !== undefined) {
+      await repairCreatedMemory(db, env, inserted, candidate);
+      responses.push(toResponse(inserted));
+      continue;
+    }
+
+    const own = await findActiveMemoryById(db, id);
+    if (own !== undefined) {
+      await repairCreatedMemory(db, env, own, candidate);
+      responses.push(toResponse(own));
+      continue;
+    }
+
+    const winner = await findActiveExactMemory(env, scope, content, prepared.contentHash, id);
+    if (winner === undefined) {
+      await setRequestCleanupVectorIds(db, request.user_id, hash, claim.leaseToken, [id]);
+      throw new TransientMemoryJobError('Memory insert conflict has no active exact winner');
+    }
+
+    await setRequestCleanupVectorIds(db, request.user_id, hash, claim.leaseToken, [id]);
+    await deleteVector(env.VECTORIZE, id);
+    await setRequestCleanupVectorIds(db, request.user_id, hash, claim.leaseToken, null);
+    responses.push(toResponse(winner));
   }
 
   return responses;
+}
+
+async function cleanupPendingRequestVectors(
+  db: ReturnType<typeof createDb>,
+  env: Env,
+  userId: string,
+  hash: string,
+  claim: LedgerClaim,
+): Promise<void> {
+  if (claim.cleanupVectorIdsJson === null) return;
+  const ids = parseCleanupVectorIds(claim.cleanupVectorIdsJson);
+  for (const id of ids) await deleteVector(env.VECTORIZE, id);
+  await setRequestCleanupVectorIds(db, userId, hash, claim.leaseToken, null);
+}
+
+function parseCleanupVectorIds(value: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed) || !parsed.every((id) => typeof id === 'string' && id.length > 0)) {
+      throw new Error('Invalid persisted memory vector cleanup marker');
+    }
+    return [...new Set(parsed)];
+  } catch (error) {
+    throw error instanceof Error && error.message === 'Invalid persisted memory vector cleanup marker'
+      ? error
+      : new Error('Invalid persisted memory vector cleanup marker');
+  }
+}
+
+async function setRequestCleanupVectorIds(
+  db: ReturnType<typeof createDb>,
+  userId: string,
+  hash: string,
+  leaseToken: number,
+  ids: string[] | null,
+): Promise<void> {
+  const rows = await db.update(memoryRequests).set({
+    cleanupVectorIdsJson: ids === null ? null : JSON.stringify(ids),
+    updatedAt: isoNow(),
+  }).where(and(
+    eq(memoryRequests.userId, userId),
+    eq(memoryRequests.idempotencyKey, hash),
+    eq(memoryRequests.status, 'processing'),
+    eq(memoryRequests.leaseToken, leaseToken),
+  )).returning({ leaseToken: memoryRequests.leaseToken }).all();
+  if (rows.length === 0) throw new TransientMemoryJobError('Memory request lease was replaced during vector cleanup');
+}
+
+async function findActiveMemoryById(
+  db: ReturnType<typeof createDb>,
+  id: string,
+): Promise<MemoryRow | undefined> {
+  return db.select().from(memories).where(and(
+    eq(memories.id, id),
+    isNull(memories.deletedAt),
+  )).get();
+}
+
+async function repairCreatedMemory(
+  db: ReturnType<typeof createDb>,
+  env: Env,
+  row: MemoryRow,
+  candidate: MemoryCandidate,
+): Promise<void> {
+  await appendHistory(db, row, 'created', await deterministicCreatedHistoryId(row.id));
+  if (candidate.extracted !== undefined) await persistExtractedGraph(db, env, row, candidate.extracted);
 }
 
 async function findLegacyMemoryResponses(
@@ -352,12 +485,22 @@ async function candidatesForLease(db: ReturnType<typeof createDb>, env: Env, req
   const extracted = request.infer
     ? await extractMemories(env, request)
     : [{ memory: request.messages.map(({ content }) => content).join('\n'), entities: [], relationships: [] }];
-  const candidates = extracted.map((item) => ({ content: item.memory, extracted: item }));
-  const nonEmpty = candidates.map((candidate) => ({ ...candidate, content: candidate.content.trim() })).filter(({ content }) => Boolean(content));
-  const rows = await db.update(memoryRequests).set({ candidatesJson: JSON.stringify(nonEmpty.map(({ extracted }) => extracted)), updatedAt: isoNow() }).where(and(
+  const trimmed = extracted
+    .map((item) => {
+      const content = item.memory.trim();
+      return { content, extracted: { ...item, memory: content } };
+    })
+    .filter(({ content }) => Boolean(content));
+  const seen = new Set<string>();
+  const candidates = trimmed.filter(({ content }) => {
+    if (seen.has(content)) return false;
+    seen.add(content);
+    return true;
+  });
+  const rows = await db.update(memoryRequests).set({ candidatesJson: JSON.stringify(candidates.map(({ extracted }) => extracted)), updatedAt: isoNow() }).where(and(
     eq(memoryRequests.userId, request.user_id), eq(memoryRequests.idempotencyKey, hash), eq(memoryRequests.status, 'processing'), eq(memoryRequests.leaseToken, claim.leaseToken),
   )).returning({ leaseToken: memoryRequests.leaseToken }).all();
-  return rows.length === 0 ? undefined : nonEmpty;
+  return rows.length === 0 ? undefined : candidates;
 }
 
 async function persistExtractedGraph(db: ReturnType<typeof createDb>, env: Env, memory: MemoryRow, extracted: ExtractedMemory): Promise<void> {
@@ -584,13 +727,36 @@ export async function updateMemory(env: Env, id: string, userId: string, request
   if (current === undefined) return null;
 
   const content = request.memory === undefined ? current.content : request.memory;
+  let nextContentHash = current.contentHash;
+  if (content !== current.content) {
+    nextContentHash = await contentHash(content);
+    const duplicate = await findActiveExactMemory(
+      env,
+      { userId: current.userId, agentId: current.agentId },
+      content,
+      nextContentHash,
+      id,
+    );
+    if (duplicate !== undefined) throw new MemoryContentConflictError();
+  }
   const metadata = { ...parseMetadata(current.metadataJson), ...(request.metadata ?? {}) };
   const now = unixNow();
-  const next = { ...current, content, metadataJson: JSON.stringify(metadata), updatedAt: now };
+  const next = {
+    ...current,
+    content,
+    contentHash: nextContentHash,
+    metadataJson: JSON.stringify(metadata),
+    updatedAt: now,
+  };
 
   const vector = await embedText(env, content);
-  await upsertVectors(env.VECTORIZE, [{ id, values: vector, metadata: vectorMetadata(next) }]);
-  await db.update(memories).set({ content, metadataJson: next.metadataJson, updatedAt: now }).where(eq(memories.id, id)).run();
+  await upsertVectors(env.VECTORIZE, [{ id, values: vector, metadata: await memoryVectorMetadata(next) }]);
+  await db.update(memories).set({
+    content,
+    contentHash: next.contentHash,
+    metadataJson: next.metadataJson,
+    updatedAt: now,
+  }).where(eq(memories.id, id)).run();
   await appendHistory(db, next, 'updated');
   return toResponse(next);
 }
@@ -643,22 +809,6 @@ function deterministicMemoryId(userId: string, hash: string, candidateIndex: num
 
 function deterministicCreatedHistoryId(memoryId: string): Promise<string> {
   return sha256Hex(`memory-history:${memoryId}:created`);
-}
-
-function vectorMetadata(row: Pick<MemoryRow, 'userId' | 'agentId' | 'runId' | 'actorId' | 'metadataJson'>): Record<string, VectorizeVectorMetadataValue> {
-  return {
-    ...scalarMetadata(row.metadataJson),
-    ...(row.userId === null ? {} : { user_id: row.userId }),
-    ...(row.agentId === null ? {} : { agent_id: row.agentId }),
-    ...(row.runId === null ? {} : { run_id: row.runId }),
-    ...(row.actorId === null ? {} : { actor_id: row.actorId }),
-  };
-}
-
-function scalarMetadata(value: string): Record<string, VectorizeVectorMetadataValue> {
-  return Object.fromEntries(Object.entries(parseMetadata(value)).filter(([, item]) => (
-    typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean'
-  ))) as Record<string, VectorizeVectorMetadataValue>;
 }
 
 function toResponse(row: MemoryRow): MemoryResponse {

@@ -8,6 +8,7 @@ import {
   getMemory,
   getMemoryById,
   listMemories,
+  MemoryContentConflictError,
   searchMemories,
   updateMemory,
 } from '../memory/service';
@@ -58,8 +59,15 @@ memoriesRoutes.patch('/:id', async (context) => {
   if (userId instanceof Response) return userId;
   const request = await parseBody(context.req.raw, UpdateMemoryRequestSchema);
   if (request instanceof Response) return request;
-  const memory = await updateMemory(context.env, context.req.param('id'), userId, request);
-  return memory === null ? notFound(context) : context.json(memory);
+  try {
+    const memory = await updateMemory(context.env, context.req.param('id'), userId, request);
+    return memory === null ? notFound(context) : context.json(memory);
+  } catch (error) {
+    if (error instanceof MemoryContentConflictError) {
+      return context.json({ error: 'An active memory with this content already exists' }, 409);
+    }
+    throw error;
+  }
 });
 
 memoriesRoutes.delete('/:id', async (context) => {
