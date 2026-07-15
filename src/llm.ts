@@ -150,8 +150,9 @@ export async function reflectWithGraphModel(env: Env, input: GraphReflectionInpu
       body: JSON.stringify({
         model: configuration.model,
         response_format: { type: 'json_object' },
-        ...(configuration.thinkingLevel === 'disabled' ? {} : { reasoning_effort: configuration.thinkingLevel }),
-        ...(configuration.thinkingLevel === 'disabled' ? {} : { thinking: { type: 'enabled' } }),
+        reasoning: configuration.thinkingLevel === 'disabled'
+          ? { enabled: false }
+          : { effort: configuration.thinkingLevel },
         messages: [
           {
             role: 'system',
