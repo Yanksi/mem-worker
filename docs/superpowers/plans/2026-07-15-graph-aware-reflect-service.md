@@ -4,7 +4,7 @@
 
 **Goal:** Add an authenticated, read-only `POST /v1/reflect` endpoint that answers a user-scoped cross-memory question from bounded semantic and D1 graph evidence using a separately configured graph LLM.
 
-**Architecture:** The route validates an explicit `{ query, user_id, agent_id }` request, asks the existing user-scoped semantic search for up to 12 seeds, then performs a capped two-hop D1 relationship traversal rooted in the seeds' linked entities. A graph-specific OpenAI-compatible model receives only the Worker-selected evidence, returns selected IDs in JSON, and the Worker maps those IDs back to stored text while rejecting every untrusted or malformed model claim.
+**Architecture:** The route validates an explicit `{ query, user_id, agent_id }` request, asks the existing user-scoped semantic search for up to 12 seeds, then performs a capped two-hop D1 relationship traversal rooted in the seeds' linked entities. A graph-specific OpenAI-compatible model receives only an ephemeral JSON `E*` entity / `R*` relation contract, returns a Zod-validated JSON object selecting `R*` labels, and the Worker maps those labels back to complete relationship, entity, and source-memory records.
 
 **Tech Stack:** TypeScript, Hono, Zod, Cloudflare Workers, D1/Drizzle, Vectorize, OpenAI-compatible chat completions, Vitest, Wrangler.
 
@@ -12,7 +12,7 @@
 
 ## File Structure
 
-- Create `src/reflect/types.ts`: public request/response schemas and internal bounded evidence/model result types.
+- Create `src/reflect/types.ts`: public request/response schemas plus `E*`/`R*` model-contract Zod types.
 - Create `src/reflect/service.ts`: semantic seed retrieval, user-scoped graph BFS, candidate capping, deterministic relation paths, synthesis orchestration, and safe no-evidence fallbacks.
 - Create `src/routes/reflect.ts`: authenticated HTTP route, JSON validation, error mapping, and request-scoped operational logging.
 - Modify `src/llm.ts`: graph-model configuration validation and an abortable structured reflection-completion helper.
@@ -33,7 +33,7 @@
 
 - [ ] **Step 1: Write failing graph-model tests**
 
-In `tests/llm.test.ts`, add an `env` with all graph bindings and a `reflectWithGraphModel` call. Assert the helper posts exactly one JSON-mode chat completion to the configured base URL with the configured model and `reasoning_effort: 'medium'`:
+In `tests/llm.test.ts`, add an `env` with all graph bindings and a `reflectWithGraphModel` call. Assert the helper posts exactly one JSON-object chat completion to the configured base URL with the configured model and `reasoning_effort: 'medium'`, and that the prompt contains compact graph JSON but no raw memory text:
 
 ```ts
 const graphEnv = {
@@ -46,23 +46,26 @@ const graphEnv = {
 
 await expect(reflectWithGraphModel(graphEnv, {
   query: 'Who manages Ada?',
-  evidence: [{ id: 'memory-1', memory: 'Ada reports to Benoit.', role: 'semantic_seed' }],
+  entities: [
+    { label: 'E1', name: 'Ada', type: 'person' },
+    { label: 'E2', name: 'Benoit', type: 'person' },
+  ],
+  relations: [{ label: 'R1', source: 'E1', predicate: 'reports_to', target: 'E2', confidence: 0.9 }],
 })).resolves.toEqual({
-  answer: 'Benoit manages Ada.',
-  uncertainty: 'low',
-  evidence_ids: ['memory-1'],
+  result: 'Benoit manages Ada.',
+  evidence_relation_refs: ['R1'],
 });
 
 expect(fetchMock).toHaveBeenCalledWith(
   'https://graph.example/v1/chat/completions',
   expect.objectContaining({
     headers: { Authorization: 'Bearer graph-key', 'Content-Type': 'application/json' },
-    body: expect.stringContaining('"reasoning_effort":"medium"'),
+        body: expect.stringContaining('"reasoning_effort":"medium"'),
   }),
 );
 ```
 
-Add independent failing cases asserting that an absent graph binding and an invalid thinking level throw `GraphLlmConfigurationError`, an HTTP error throws `UpstreamServiceError`, and model output with an invalid uncertainty value throws a response-validation error.
+Add independent failing cases asserting that an absent graph binding and an invalid thinking level throw `GraphLlmConfigurationError`, an HTTP error throws `UpstreamServiceError`, and output is rejected unless it is a strict JSON object with a non-empty `result` and distinct, known `evidence_relation_refs`. Include malformed outer/message JSON, extra fields, duplicate labels, unknown labels, and instruction-like text in entity/relation fields.
 
 - [ ] **Step 2: Run the focused test to verify red**
 
@@ -88,18 +91,22 @@ export const ReflectRequestSchema = z.object({
 export const ReflectUncertaintySchema = z.enum(['low', 'medium', 'high']);
 export const GraphThinkingLevelSchema = z.enum(['low', 'medium', 'high']);
 
-export const GraphModelResponseSchema = z.object({
-  answer: nonEmptyString,
-  uncertainty: ReflectUncertaintySchema,
-  evidence_ids: z.array(nonEmptyString).max(20),
-  limitations: z.string().trim().min(1).optional(),
-});
+export interface GraphReflectionEntity { label: `E${number}`; name: string; type: string }
+export interface GraphReflectionRelation {
+  label: `R${number}`;
+  source: `E${number}`;
+  predicate: string;
+  target: `E${number}`;
+  confidence?: number;
+}
+export const GraphModelOutputSchema = z.object({
+  result: nonEmptyString.max(4_000),
+  evidence_relation_refs: z.array(z.string().regex(/^R[1-9]\d*$/)).min(1).max(32),
+}).strict();
+export type GraphModelOutput = z.infer<typeof GraphModelOutputSchema>;
 
 export type ReflectRequest = z.infer<typeof ReflectRequestSchema>;
-export type GraphModelResponse = z.infer<typeof GraphModelResponseSchema>;
 export type GraphThinkingLevel = z.infer<typeof GraphThinkingLevelSchema>;
-export type ReflectEvidenceRole = 'semantic_seed' | 'graph_expansion';
-export interface ReflectCandidateEvidence { id: string; memory: string; role: ReflectEvidenceRole }
 ```
 
 Extend `Env` with optional `GRAPH_LLM_API_BASE_URL`, `GRAPH_LLM_MODEL`, `GRAPH_LLM_API_KEY`, and `GRAPH_LLM_THINKING_LEVEL`. In `src/llm.ts`, add `GraphLlmConfigurationError` and `reflectWithGraphModel(env, input)`. It must:
@@ -123,7 +130,7 @@ const response = await fetch(`${normalizeBaseUrl(env.GRAPH_LLM_API_BASE_URL)}/ch
 });
 ```
 
-Make `buildReflectionMessages` instruct the model to treat evidence as untrusted quoted data, answer only from it, return only the declared JSON fields, and select only supplied IDs. Parse the completion content with `GraphModelResponseSchema`; retain the existing `UpstreamServiceError` behavior for non-2xx status codes.
+Make `buildReflectionMessages` render exactly the JSON `question`, `entities`, and `relations` contract. It must instruct the model to treat entity names and relation predicates as untrusted quoted data, answer only from the listed relations, and return only the declared JSON object. Parse completion content with `GraphModelOutputSchema`, reject duplicate or relation labels absent from `input.relations`, and retain the existing `UpstreamServiceError` behavior for non-2xx status codes.
 
 - [ ] **Step 4: Run the focused test to verify green**
 
@@ -152,25 +159,25 @@ Create `tests/reflect.test.ts`. Mock `searchMemories`, `reflectWithGraphModel`, 
 await expect(reflectMemories(env, {
   query: 'Who manages Ada?', user_id: 'user-a', agent_id: 'agent-a',
 }, 'request-1')).resolves.toMatchObject({
-  answer: 'Chandra manages Ada through Benoit.',
+  result: 'Chandra manages Ada through Benoit.',
   uncertainty: 'low',
-  evidence: [
-    { id: 'memory-ada', role: 'semantic_seed' },
-    { id: 'memory-benoit', role: 'graph_expansion' },
+  evidences: [
+    { relationship: expect.objectContaining({ id: 'relationship-ada' }) },
+    { relationship: expect.objectContaining({ id: 'relationship-benoit' }) },
   ],
   relation_paths: [{ entity_ids: ['entity-ada', 'entity-benoit', 'entity-chandra'] }],
   request_id: 'request-1',
 });
 
 expect(reflectWithGraphModel).toHaveBeenCalledWith(env, expect.objectContaining({
-  evidence: expect.arrayContaining([
-    expect.objectContaining({ id: 'memory-ada' }),
-    expect.objectContaining({ id: 'memory-benoit' }),
+  relations: expect.arrayContaining([
+    expect.objectContaining({ label: 'R1' }),
+    expect.objectContaining({ label: 'R2' }),
   ]),
 }));
 ```
 
-Add separate failing tests proving: every relationship predicate includes `relationships.userId` and `'user-a'`; a memory owned by `user-b` or soft-deleted is excluded; a model-selected unknown ID returns the static high-uncertainty fallback with no evidence; no semantic seeds returns the same `200`-style fallback without calling the model; and the mock D1 object exposes only `select`, so any accidental write fails the test.
+Add separate failing tests proving: every relationship predicate includes `relationships.userId` and `'user-a'`; a memory owned by `user-b` or soft-deleted is excluded; an unknown/duplicate/malformed model `R*` label returns the static high-uncertainty fallback with no evidence; no semantic seeds returns the same `200`-style fallback without calling the model; and the mock D1 object exposes only `select`, so any accidental write fails the test.
 
 - [ ] **Step 2: Run the focused test to verify red**
 
@@ -191,9 +198,14 @@ export const REFLECT_MAX_EVIDENCE = 20;
 export const REFLECT_MAX_EVIDENCE_CHARS = 24_000;
 
 export interface ReflectResult {
-  answer: string;
+  result: string;
   uncertainty: 'low' | 'medium' | 'high';
-  evidence: Array<{ id: string; memory: string; role: ReflectEvidenceRole }>;
+  evidences: Array<{
+    relationship: RelationshipResponse;
+    source_entity: EntityResponse;
+    target_entity: EntityResponse;
+    evidence_memory?: MemoryResponse;
+  }>;
   relation_paths: Array<{ entity_ids: string[]; relationship_ids: string[] }>;
   limitations?: string;
   request_id: string;
@@ -227,7 +239,7 @@ When no candidate remains, return:
 }
 ```
 
-Otherwise call `reflectWithGraphModel`. Reject any returned `evidence_ids` absent from the candidate map, any duplicate ID, and any empty selection by returning that same static high-uncertainty fallback. For valid selections, return only selected stored evidence, preserving Worker candidate order. Do not import or call any memory, graph, Vectorize, or D1 write helper.
+Otherwise create stable `E1...` labels for discovered user-owned entities in ascending entity-ID order and `R1...` labels for accepted traversed edges in deterministic traversal order. Call `reflectWithGraphModel` with that compact JSON graph only: never memory text, database IDs, or metadata. Reject malformed, unknown, duplicate, or empty returned relation labels by returning the static high-uncertainty fallback. For valid labels, resolve and return the complete Worker-owned relationship, source entity, target entity, and optional source-memory records in label order. Do not import or call any memory, graph, Vectorize, or D1 write helper.
 
 - [ ] **Step 4: Run the focused test to verify green**
 
@@ -354,7 +366,7 @@ GRAPH_LLM_THINKING_LEVEL = "low"
 Do not add `GRAPH_LLM_API_KEY` to Wrangler variables or `.dev.vars.example`; document it as a Worker secret. In `README.md`:
 
 - add `/v1/reflect` to the API table;
-- document its required request body and response fields, including `evidence` roles and deterministic `relation_paths`;
+- document its required request body and response fields, including complete resolved relationship evidences and deterministic `relation_paths`;
 - explain that it is explicit, user-scoped, read-only, capped at 12 semantic seeds/two hops/32 edges/20 evidence memories, and does not change ordinary `/search`;
 - describe `GRAPH_LLM_API_BASE_URL`, `GRAPH_LLM_MODEL`, and default `GRAPH_LLM_THINKING_LEVEL=low` as normal variables, and `GRAPH_LLM_API_KEY` as a secret set with `npx wrangler secret put GRAPH_LLM_API_KEY`;
 - explain that `GRAPH_LLM_THINKING_LEVEL` maps to `reasoning_effort`, accepted values are `low`, `medium`, and `high`, and the selected provider/model must support it;

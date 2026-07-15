@@ -12,10 +12,12 @@ the existing API-key middleware. `user_id` is the non-negotiable retrieval and
 storage boundary; `agent_id` is returned only as request provenance in worker
 logs and does not narrow the memory scope.
 
-Successful responses always contain `answer`, `evidence`, and `uncertainty`.
-They may include deterministically computed `relation_paths`, `limitations`,
-and a generated request ID. Insufficient evidence is a successful response
-with an empty evidence array and `uncertainty: "high"`.
+Successful responses always contain a `result`, resolved `evidences`, and
+`uncertainty`. Every resolved evidence is a complete Worker-owned record: the
+relationship, its source and target entities, and its source memory when one
+exists. They may include deterministically computed `relation_paths`,
+`limitations`, and a generated request ID. Insufficient evidence is a
+successful response with an empty evidence array and `uncertainty: "high"`.
 
 ## Retrieval And Graph Expansion
 
@@ -46,10 +48,37 @@ reflection request only. It does not silently fall back to the extraction
 model, because reflection is a distinct workload with its own cost and quality
 requirements. Providers and models must support `reasoning_effort`; an
 unsupported parameter or value is surfaced as a clear upstream configuration
-failure rather than silently being ignored. Evidence text is passed as
-untrusted data inside explicit memory delimiters. The model must return JSON
-with an answer, an uncertainty enum, optional limitations, and selected
-evidence IDs.
+failure rather than silently being ignored.
+
+The Worker never sends raw memory records to the reflection model. It constructs
+an ephemeral, request-local JSON graph contract from the bounded traversal:
+
+```json
+{
+  "question": "<query>",
+  "entities": [{ "ref": "E1", "name": "<entity name>", "type": "<entity type>" }],
+  "relations": [{ "ref": "R1", "source": "E1", "predicate": "<relation type>", "target": "E2", "confidence": 0.9 }]
+}
+```
+
+`E*` and `R*` are Worker-generated labels, not database IDs. The model must
+return exactly this JSON structure through the OpenAI-compatible JSON-object
+response mode:
+
+```json
+{
+  "result": "<grounded natural-language answer>",
+  "evidence_relation_refs": ["R1", "R2"]
+}
+```
+
+The Worker Zod-validates the JSON shape, a non-empty result, and a non-empty
+set of known `R*` labels. It rejects extra fields, duplicate or unknown labels,
+and malformed output. The Worker then maps the selected labels back to complete
+relationship/entity/source-memory records.
+It derives `uncertainty` from whether valid graph evidence was selected; the
+model does not control evidence structure, database identifiers, tenant scope,
+or graph queries.
 
 The Worker validates that every selected evidence ID came from the bounded
 candidate set and maps IDs back to the stored text and deterministic role
@@ -80,9 +109,10 @@ and variables.
 - User A data never appears in User B results.
 - Empty or unsupported evidence returns `200`, empty evidence, and high
   uncertainty.
-- Traversal caps, soft-deleted records, malformed model JSON, unknown evidence
-  IDs, prompt-injection-like memory text, invalid thinking levels, unsupported
-  provider thinking parameters, and upstream timeout all fail closed.
+- Traversal caps, soft-deleted records, malformed model text, unknown or
+  duplicate `R*` labels, prompt-injection-like entity or relation text, invalid
+  thinking levels, unsupported provider thinking parameters, and upstream
+  timeout all fail closed.
 - A read-only invariant verifies no memory, entity, relationship, or vector
   write service is called.
 
