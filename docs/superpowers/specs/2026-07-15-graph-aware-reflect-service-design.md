@@ -44,15 +44,12 @@ dedicated, explicitly configured OpenAI-compatible model: `GRAPH_LLM_API_BASE_UR
 the endpoint returns a clear configuration error when any member is missing.
 `GRAPH_LLM_THINKING_LEVEL` is an optional `disabled`, `low`, `medium`, or
 `high` variable; it defaults to `low`. `disabled` sends no reasoning controls.
-The other values are sent as `reasoning_effort` for this reflection request
-only. For the DeepSeek OpenAI-compatible endpoint (`api.deepseek.com`), an
-enabled level also automatically sends `thinking: {"type":"enabled"}` as
-required by its V4 thinking mode; other providers do not receive that
-DeepSeek-specific field. Reflection does not silently fall back to the
-extraction model, because it is a distinct workload with its own cost and
-quality requirements. Providers and models must support `reasoning_effort`; an
-unsupported parameter or value is surfaced as a clear upstream configuration
-failure rather than silently being ignored.
+The other values are sent as `reasoning_effort` plus
+`thinking: {"type":"enabled"}` for this reflection request only. Reflection
+does not silently fall back to the extraction model, because it is a distinct
+workload with its own cost and quality requirements. Providers and models must
+support these controls; an unsupported parameter or value is surfaced as a
+clear upstream configuration failure rather than silently being ignored.
 
 The Worker never sends raw memory records to the reflection model. It constructs
 an ephemeral, request-local JSON graph contract from the bounded traversal:
