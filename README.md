@@ -13,6 +13,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - A Cloudflare Worker HTTP API for adding, searching, listing, reading, updating, and soft-deleting memories.
 - OpenAI-compatible chat-completion fact extraction and embedding requests, using the configured OpenAI API endpoint and models.
 - Cloudflare Vectorize upserts, deletes, scoped semantic search, and validated metadata filters.
+- Mem0-compatible entity linking that boosts inferred user-memory search results without changing Hermes requests.
 - D1-backed memory metadata, audit history, graph-lite entities, relationships, and memory/entity links.
 - Durable tenant-scoped idempotency records, retry-safe deterministic writes, and a Queue consumer for asynchronous ingestion.
 - Extracted entity and relationship persistence, plus read-only graph endpoints.
@@ -34,7 +35,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 
 - **Worker / Hono** exposes the API, health check, and dashboard.
 - **D1** stores memories, idempotency/request state, history, and graph-lite entities/relationships.
-- **Vectorize** stores 1536-dimensional embeddings and metadata for semantic search.
+- **Vectorize** stores memory embeddings plus a parallel entity index used for Mem0-style entity-link score fusion.
 - **Queues** receives asynchronous extraction-and-store jobs.
 - **OpenAI-compatible endpoints** are used for embeddings and chat-completion memory extraction. They default to the OpenAI API, but extraction and embedding base URLs can be configured independently.
 
@@ -51,7 +52,7 @@ Both endpoints are configured independently and must implement the OpenAI-compat
 
 ### Hermes compatibility
 
-The Worker supports the request contract used by Hermes's self-hosted Mem0 adapter when Hermes is configured with a `/v1` base URL:
+The Worker supports the request contract used by Hermes's self-hosted Mem0 adapter when Hermes is configured with a `/v1` base URL. User-scoped `infer: true` writes and normal search use entity linking transparently; Hermes needs no graph-specific setting:
 
 - `POST /v1/memories` accepts `X-API-Key: $MEM0_API_KEY` and the standard Mem0 add payload.
 - `POST /v1/search` and `POST /v1/memories/search` accept `top_k` plus `filters.user_id`; optional `agent_id`, `run_id`, and `actor_id` are scoped fields, while other filters are preserved as Vectorize metadata filters.
@@ -233,6 +234,7 @@ npm run typecheck
 
    ```sh
    npx wrangler vectorize create mem0-edge --dimensions=1536 --metric=cosine
+   npx wrangler vectorize create mem0-edge-entities --dimensions=1536 --metric=cosine
    ```
 
 3. Create the configured Queue:
@@ -248,6 +250,7 @@ npm run typecheck
    npx wrangler vectorize create-metadata-index mem0-edge --property-name=agent_id --type=string
    npx wrangler vectorize create-metadata-index mem0-edge --property-name=run_id --type=string
    npx wrangler vectorize create-metadata-index mem0-edge --property-name=actor_id --type=string
+   npx wrangler vectorize create-metadata-index mem0-edge-entities --property-name=user_id --type=string
    ```
 
 5. Apply the D1 migrations from the configured `src/migrations` directory:
