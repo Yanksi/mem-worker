@@ -41,6 +41,10 @@ export interface Env {
   LLM_MODEL: string;
   LLM_API_BASE_URL?: string;
   EMBEDDING_API_BASE_URL?: string;
+  GRAPH_LLM_API_BASE_URL?: string;
+  GRAPH_LLM_MODEL?: string;
+  GRAPH_LLM_API_KEY?: string;
+  GRAPH_LLM_THINKING_LEVEL?: string;
   VECTOR_DIMENSIONS: string;
   MEM0_INDEX_NAME: string;
 }

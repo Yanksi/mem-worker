@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/env';
-import { embedText, extractMemories, UpstreamServiceError } from '../src/llm';
+import {
+  embedText,
+  extractMemories,
+  GraphLlmConfigurationError,
+  reflectWithGraphModel,
+  UpstreamServiceError,
+} from '../src/llm';
 
 const env = {
   OPENAI_API_KEY: 'openai-key',
@@ -168,5 +174,100 @@ describe('extractMemories', () => {
 
     vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: 'not json' } }] }), { status: 200 })));
     await expect(extractMemories(env, request)).rejects.toThrow('OpenAI memory extraction response contained invalid JSON');
+  });
+});
+
+describe('reflectWithGraphModel', () => {
+  const input = {
+    query: 'Who manages Ada?',
+    evidence: [{
+      id: 'memory-1',
+      memory: 'Ada works with Benoit.',
+      role: 'semantic_seed' as const,
+    }],
+  };
+
+  const graphEnv = {
+    ...env,
+    GRAPH_LLM_API_BASE_URL: 'https://graph.example/v1/',
+    GRAPH_LLM_MODEL: 'graph-reasoner',
+    GRAPH_LLM_API_KEY: 'graph-key',
+  };
+
+  it('uses only configured graph credentials, model, endpoint, and default low reasoning', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({
+          answer: 'The supplied evidence does not say who manages Ada.',
+          uncertainty: 'high',
+          evidence_ids: ['memory-1'],
+        }) } }],
+      }), { status: 200 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(reflectWithGraphModel(graphEnv, input)).resolves.toEqual({
+      answer: 'The supplied evidence does not say who manages Ada.',
+      uncertainty: 'high',
+      evidence_ids: ['memory-1'],
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://graph.example/v1/chat/completions',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { Authorization: 'Bearer graph-key', 'Content-Type': 'application/json' },
+        signal: expect.any(AbortSignal),
+        body: expect.stringContaining('"model":"graph-reasoner"'),
+      }),
+    );
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+      model: 'graph-reasoner',
+      response_format: { type: 'json_object' },
+      reasoning_effort: 'low',
+    });
+    expect(fetchMock.mock.calls[0][1].body).toContain('untrusted evidence');
+    expect(fetchMock.mock.calls[0][1].body).toContain('memory-1');
+  });
+
+  it('uses the configured graph thinking level', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: 'Benoit is connected to Ada.', uncertainty: 'medium', evidence_ids: ['memory-1'],
+      }) } }] }), { status: 200 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await reflectWithGraphModel({ ...graphEnv, GRAPH_LLM_THINKING_LEVEL: 'high' }, input);
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({ reasoning_effort: 'high' });
+  });
+
+  it.each([
+    ['GRAPH_LLM_API_BASE_URL', { ...graphEnv, GRAPH_LLM_API_BASE_URL: undefined }],
+    ['GRAPH_LLM_MODEL', { ...graphEnv, GRAPH_LLM_MODEL: undefined }],
+    ['GRAPH_LLM_API_KEY', { ...graphEnv, GRAPH_LLM_API_KEY: undefined }],
+    ['GRAPH_LLM_THINKING_LEVEL', { ...graphEnv, GRAPH_LLM_THINKING_LEVEL: 'max' }],
+  ])('rejects missing or invalid %s configuration', async (_field, invalidEnv) => {
+    await expect(reflectWithGraphModel(invalidEnv, input)).rejects.toBeInstanceOf(GraphLlmConfigurationError);
+  });
+
+  it('retains upstream status errors', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response('unavailable', { status: 503, statusText: 'Service Unavailable' }),
+    ));
+
+    await expect(reflectWithGraphModel(graphEnv, input)).rejects.toMatchObject({
+      name: 'UpstreamServiceError', status: 503,
+    } satisfies Partial<UpstreamServiceError>);
+  });
+
+  it('rejects invalid graph response uncertainty values', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: 'Ada is managed by Benoit.', uncertainty: 'certain', evidence_ids: ['memory-1'],
+      }) } }] }), { status: 200 }),
+    ));
+
+    await expect(reflectWithGraphModel(graphEnv, input)).rejects.toThrow();
   });
 });
