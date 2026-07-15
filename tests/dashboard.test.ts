@@ -253,7 +253,9 @@ describe('dashboard login', () => {
     }), env);
     const [name, value] = login.headers.get('Set-Cookie')!.split(';', 1)[0].split('=');
     const [expiresAt, signature] = value.split('.');
-    const tamperedSignature = `${signature.slice(0, -1)}${signature.endsWith('A') ? 'B' : 'A'}`;
+    // Do not change the final base64url character: its unused padding bits can
+    // decode to the same byte. Mutating the first character always changes HMAC input.
+    const tamperedSignature = `${signature.startsWith('A') ? 'B' : 'A'}${signature.slice(1)}`;
 
     const response = await worker.fetch(request('/dashboard', {
       headers: { Cookie: `${name}=${expiresAt}.${tamperedSignature}` },
