@@ -34,22 +34,42 @@ vi.mock('../src/import/service', () => importService);
 import worker from '../src/index';
 
 const env = { DASHBOARD_PASSWORD: 'dashboard-secret', VECTORIZE: {} as VectorizeIndex } as Env;
+const readOnlyEnv = { ...env, DASHBOARD_READ_ONLY: 'true' } as Env;
 
 function request(path: string, init?: RequestInit): Request {
   return new Request(`https://example.com${path}`, init);
 }
 
-async function dashboardCookie(): Promise<string> {
+async function dashboardCookie(targetEnv: Env = env): Promise<string> {
   const response = await worker.fetch(request('/dashboard/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: 'password=dashboard-secret',
-  }), env);
+  }), targetEnv);
   return response.headers.get('Set-Cookie')!.split(';', 1)[0];
 }
 
 describe('dashboard operator API', () => {
   beforeEach(() => vi.clearAllMocks());
+
+  it('blocks authenticated dashboard mutations in the remote read-only preview before parsing request bodies', async () => {
+    const headers = { Cookie: await dashboardCookie(readOnlyEnv), 'Content-Type': 'application/json' };
+    const responses = await Promise.all([
+      worker.fetch(request('/dashboard/api/users/discord%3A42/alias', { method: 'PUT', headers, body: 'not-json' }), readOnlyEnv),
+      worker.fetch(request('/dashboard/api/deduplication', { method: 'POST', headers, body: 'not-json' }), readOnlyEnv),
+      worker.fetch(request('/dashboard/api/imports/mem0', { method: 'POST', headers, body: 'not-json' }), readOnlyEnv),
+      worker.fetch(request('/dashboard/api/entities/reclassify-agent', { method: 'POST', headers, body: 'not-json' }), readOnlyEnv),
+    ]);
+
+    for (const response of responses) {
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toEqual({ error: 'Dashboard is read-only in this preview' });
+    }
+    expect(dashboardService.setDashboardUserAlias).not.toHaveBeenCalled();
+    expect(dashboardService.softDeleteDashboardMemories).not.toHaveBeenCalled();
+    expect(importService.enqueueMem0Import).not.toHaveBeenCalled();
+    expect(importService.enqueueMem0AgentReclassification).not.toHaveBeenCalled();
+  });
 
   it('requires a signed dashboard session', async () => {
     const response = await worker.fetch(request('/dashboard/api/users'), env);

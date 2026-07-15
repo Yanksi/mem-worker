@@ -60,6 +60,8 @@ dashboardRoutes.get('/api/users', async (context) => {
 });
 
 dashboardRoutes.put('/api/users/:userId/alias', async (context) => {
+  const readOnlyError = dashboardMutationReadOnlyError(context.env);
+  if (readOnlyError !== undefined) return context.json(readOnlyError, 403);
   const body = await context.req.json<{ alias?: unknown }>().catch(() => null);
   if (body === null || typeof body.alias !== 'string') return context.json({ error: 'Validation failed' }, 400);
   await setDashboardUserAlias(context.env, context.req.param('userId'), body.alias);
@@ -81,6 +83,8 @@ dashboardRoutes.get('/api/deduplication', async (context) => {
 });
 
 dashboardRoutes.post('/api/deduplication', async (context) => {
+  const readOnlyError = dashboardMutationReadOnlyError(context.env);
+  if (readOnlyError !== undefined) return context.json(readOnlyError, 403);
   const body = await context.req.json<{ entity_type?: unknown; entity_id?: unknown; confirm?: unknown }>().catch(() => null);
   const scope = body === null ? undefined : dashboardScope(body.entity_type, body.entity_id, undefined);
   if (scope === undefined || body?.confirm !== true) return context.json({ error: 'Validation failed' }, 400);
@@ -109,6 +113,8 @@ dashboardRoutes.post('/api/search', async (context) => {
 });
 
 dashboardRoutes.post('/api/imports/mem0', async (context) => {
+  const readOnlyError = dashboardMutationReadOnlyError(context.env);
+  if (readOnlyError !== undefined) return context.json(readOnlyError, 403);
   const body = await context.req.json<unknown>().catch(() => null);
   const parsed = DashboardMem0ImportRequest.safeParse(body);
   if (!parsed.success) return context.json({ error: 'Validation failed' }, 400);
@@ -121,6 +127,8 @@ dashboardRoutes.post('/api/imports/mem0', async (context) => {
 });
 
 dashboardRoutes.post('/api/entities/reclassify-agent', async (context) => {
+  const readOnlyError = dashboardMutationReadOnlyError(context.env);
+  if (readOnlyError !== undefined) return context.json(readOnlyError, 403);
   const body = await context.req.json<{ source_user_id?: unknown; agent_id?: unknown }>().catch(() => null);
   const sourceUserId = typeof body?.source_user_id === 'string' ? body.source_user_id : context.req.query('source_user_id');
   const agentId = typeof body?.agent_id === 'string' ? body.agent_id : context.req.query('agent_id');
@@ -153,6 +161,12 @@ function dashboardScope(entityType: unknown, entityId: unknown, legacyUserId: un
   }
   if (typeof legacyUserId === 'string' && legacyUserId.trim() !== '') return { entityType: 'user', entityId: legacyUserId };
   return undefined;
+}
+
+function dashboardMutationReadOnlyError(env: Env): { error: string } | undefined {
+  return env.DASHBOARD_READ_ONLY === 'true'
+    ? { error: 'Dashboard is read-only in this preview' }
+    : undefined;
 }
 
 async function hasValidDashboardSession(cookieHeader: string | undefined, password: string): Promise<boolean> {
