@@ -36,6 +36,7 @@ export interface Env {
   OPENAI_API_KEY: string;
   MEM0_API_KEY: string;
   DASHBOARD_PASSWORD: string;
+  DASHBOARD_READ_ONLY?: string;
   EMBEDDING_MODEL: string;
   LLM_MODEL: string;
   LLM_API_BASE_URL?: string;
