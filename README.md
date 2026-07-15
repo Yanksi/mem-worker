@@ -48,7 +48,7 @@ All `/v1/*` routes require `Authorization: Bearer $MEM0_API_KEY`. The dashboard 
 - **Extraction endpoint:** `https://openrouter.ai/api/v1` by default (`LLM_API_BASE_URL`)
 - **Embedding endpoint:** `https://openrouter.ai/api/v1` by default (`EMBEDDING_API_BASE_URL`)
 
-Graph reflection uses a separate OpenRouter-backed model configuration: `GRAPH_LLM_API_BASE_URL`, `GRAPH_LLM_MODEL`, `GRAPH_LLM_THINKING_LEVEL`, and the `GRAPH_LLM_API_KEY` secret. Its default model is `deepseek/deepseek-v4-flash` with `low` reasoning. The graph reflection request uses OpenRouter's unified `reasoning` parameter, so this feature is currently adapted only for an OpenRouter endpoint.
+Graph reflection uses separate Worker variables: `GRAPH_LLM_API_BASE_URL` (default `https://openrouter.ai/api/v1`), `GRAPH_LLM_MODEL` (default `deepseek/deepseek-v4-flash`), and `GRAPH_LLM_THINKING_LEVEL` (default `low`). Set `GRAPH_LLM_API_KEY` as a Cloudflare secret; it is intentionally not a `wrangler.toml` variable. Thinking levels `disabled`, `low`, `medium`, and `high` map to OpenRouter's `reasoning` object: `disabled` sends `{ "enabled": false }`, while the other values send `{ "effort": "low" | "medium" | "high" }`. Graph reflection currently only adapts the OpenRouter endpoint.
 
 Both endpoints are configured independently and must implement the OpenAI-compatible `/chat/completions` or `/embeddings` path respectively. Base URLs may include `/v1`; trailing slashes are ignored.
 
@@ -83,6 +83,7 @@ Example Hermes configuration:
 | `POST` | `/v1/memories` | Add/extract memories; supports synchronous and queued work. |
 | `POST` | `/v1/memories/search` | Semantic search, scoped by `user_id` and optional identity fields. |
 | `POST` | `/v1/search` | Hermes-compatible semantic search using `top_k` and identity values inside `filters`. |
+| `POST` | `/v1/reflect` | Reflect on a bounded, read-only graph retrieved from semantic memory seeds. |
 | `GET` | `/v1/memories?user_id=...&limit=...` | List a user's active memories. |
 | `GET`, `PATCH`, `DELETE` | `/v1/memories/:id?user_id=...` | Native read, update, or delete a memory. |
 | `PUT`, `DELETE` | `/v1/memories/:id` | Hermes-compatible update or delete using the stored user owner. |
@@ -98,6 +99,64 @@ Example Hermes configuration:
 ```
 
 The request is idempotent; use `request_id` when the caller needs a stable caller-supplied key.
+
+### Reflect on a bounded graph
+
+`POST /v1/reflect` accepts `query`, `user_id`, and `agent_id`. It performs explicit read-only bounded graph retrieval: up to 12 semantic-memory seeds, two graph hops, 24 entities, 32 edges, and 20 candidate memories capped at 24,000 characters. It does not write memories or graph records, and does not change `/v1/search` behavior.
+
+```sh
+curl -X POST "$MEM0_URL/v1/reflect" \
+  -H "Authorization: Bearer $MEM0_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Who manages Ada?",
+    "user_id": "user-123",
+    "agent_id": "agent-456"
+  }'
+```
+
+```json
+{
+  "result": "Chandra manages Ada through Benoit.",
+  "uncertainty": "medium",
+  "evidences": [
+    {
+      "relationship": {
+        "id": "relationship-ada", "user_id": "user-123", "source_entity_id": "entity-ada", "target_entity_id": "entity-benoit", "relation_type": "reports_to", "confidence": 0.9, "evidence_memory_id": "memory-ada", "metadata": {}, "created_at": "2026-07-15T00:00:00.000Z", "updated_at": "2026-07-15T00:00:00.000Z"
+      },
+      "source_entity": {
+        "id": "entity-ada", "user_id": "user-123", "name": "Ada", "type": "person", "metadata": {}, "created_at": "2026-07-15T00:00:00.000Z", "updated_at": "2026-07-15T00:00:00.000Z"
+      },
+      "target_entity": {
+        "id": "entity-benoit", "user_id": "user-123", "name": "Benoit", "type": "person", "metadata": {}, "created_at": "2026-07-15T00:00:01.000Z", "updated_at": "2026-07-15T00:00:01.000Z"
+      },
+      "evidence_memory": {
+        "id": "memory-ada", "memory": "Ada reports to Benoit.", "user_id": "user-123", "agent_id": "agent-456", "metadata": {}, "created_at": "2026-07-15T00:00:00.000Z", "updated_at": "2026-07-15T00:00:00.000Z"
+      }
+    },
+    {
+      "relationship": {
+        "id": "relationship-benoit", "user_id": "user-123", "source_entity_id": "entity-benoit", "target_entity_id": "entity-chandra", "relation_type": "managed_by", "confidence": 0.8, "evidence_memory_id": "memory-benoit", "metadata": {}, "created_at": "2026-07-15T00:00:01.000Z", "updated_at": "2026-07-15T00:00:01.000Z"
+      },
+      "source_entity": {
+        "id": "entity-benoit", "user_id": "user-123", "name": "Benoit", "type": "person", "metadata": {}, "created_at": "2026-07-15T00:00:01.000Z", "updated_at": "2026-07-15T00:00:01.000Z"
+      },
+      "target_entity": {
+        "id": "entity-chandra", "user_id": "user-123", "name": "Chandra", "type": "person", "metadata": {}, "created_at": "2026-07-15T00:00:02.000Z", "updated_at": "2026-07-15T00:00:02.000Z"
+      },
+      "evidence_memory": {
+        "id": "memory-benoit", "memory": "Benoit is managed by Chandra.", "user_id": "user-123", "agent_id": "agent-456", "metadata": {}, "created_at": "2026-07-15T00:00:01.000Z", "updated_at": "2026-07-15T00:00:01.000Z"
+      }
+    }
+  ],
+  "relation_paths": [
+    { "entity_ids": ["entity-ada", "entity-benoit", "entity-chandra"], "relationship_ids": ["relationship-ada", "relationship-benoit"] }
+  ],
+  "request_id": "example-reflect-request-id"
+}
+```
+
+The returned evidences contain complete relationship, source-entity, target-entity, and supporting-memory records. `relation_paths` identifies the entity and relationship IDs supporting the result; `request_id` is generated for each request.
 
 ## Dashboard
 
@@ -264,7 +323,7 @@ npm run typecheck
    npx wrangler vectorize create-metadata-index mem0-edge-entities --property-name=user_id --type=string
    ```
 
-5. Apply the D1 migrations from the configured `src/migrations` directory:
+5. Apply the D1 migrations from the configured `src/migrations` directory. Migration `0005_reflect_graph_indexes.sql` must be applied before deploying graph reflection:
 
    ```sh
    npx wrangler d1 migrations apply mem0-edge --remote
@@ -275,9 +334,9 @@ npm run typecheck
    ```sh
    npx wrangler secret put OPENAI_API_KEY
    npx wrangler secret put MEM0_API_KEY
-npx wrangler secret put DASHBOARD_PASSWORD
-npx wrangler secret put GRAPH_LLM_API_KEY
-```
+   npx wrangler secret put DASHBOARD_PASSWORD
+   npx wrangler secret put GRAPH_LLM_API_KEY
+   ```
 
 `EMBEDDING_MODEL` and `LLM_MODEL` are runtime settings. `VECTOR_DIMENSIONS` and `MEM0_INDEX_NAME` document the deployment convention; the effective Vectorize resource is the `[[vectorize]]` binding, and its dimensions must match the embedding model response.
 

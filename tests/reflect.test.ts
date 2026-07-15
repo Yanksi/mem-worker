@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { entities, memories, memoryEntityLinks, relationships } from '../src/db/schema';
 import type { Env } from '../src/env';
+// Vite supplies raw assets at test runtime; this project does not include Vite's ambient declarations.
+// @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
+import readme from '../README.md?raw';
+// @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
+import wranglerConfig from '../wrangler.toml?raw';
 
 const dependencies = vi.hoisted(() => ({
   createDb: vi.fn(),
@@ -208,6 +213,17 @@ describe('reflectMemories', () => {
       relationshipRows[0] = { ...relationshipRows[0], evidenceMemoryId: 'memory-ada' };
       relationshipRows[1] = { ...relationshipRows[1], evidenceMemoryId: 'memory-benoit' };
     }
+  });
+});
+
+describe('graph reflection deployment documentation', () => {
+  it('sets OpenRouter graph defaults without declaring the graph API key and documents reflection', () => {
+    expect(wranglerConfig).toContain('GRAPH_LLM_API_BASE_URL = "https://openrouter.ai/api/v1"');
+    expect(wranglerConfig).toContain('GRAPH_LLM_MODEL = "deepseek/deepseek-v4-flash"');
+    expect(wranglerConfig).toContain('GRAPH_LLM_THINKING_LEVEL = "low"');
+    expect(wranglerConfig).not.toMatch(/^GRAPH_LLM_API_KEY\s*=/m);
+    expect(readme).toContain('| `POST` | `/v1/reflect` |');
+    expect(readme).toContain('### Reflect on a bounded graph');
   });
 });
 
