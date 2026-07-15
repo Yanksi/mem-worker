@@ -11,7 +11,8 @@ import {
 } from '../src/llm';
 
 const env = {
-  OPENAI_API_KEY: 'openai-key',
+  LLM_API_KEY: 'extraction-key',
+  EMBEDDING_API_KEY: 'embedding-key',
   EMBEDDING_MODEL: 'text-embedding-3-small',
   LLM_MODEL: 'gpt-4.1-mini',
 } as Env;
@@ -32,7 +33,7 @@ describe('embedText', () => {
       'https://api.openai.com/v1/embeddings',
       expect.objectContaining({
         method: 'POST',
-        headers: { Authorization: 'Bearer openai-key', 'Content-Type': 'application/json' },
+        headers: { Authorization: 'Bearer embedding-key', 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: 'text-embedding-3-small', input: 'Remember the launch date.' }),
       }),
     );
@@ -119,7 +120,7 @@ describe('extractMemories', () => {
       'https://api.openai.com/v1/chat/completions',
       expect.objectContaining({
         method: 'POST',
-        headers: { Authorization: 'Bearer openai-key', 'Content-Type': 'application/json' },
+        headers: { Authorization: 'Bearer extraction-key', 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: 'gpt-4.1-mini',
           response_format: { type: 'json_object' },

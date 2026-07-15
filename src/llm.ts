@@ -49,7 +49,7 @@ export async function embedText(env: Env, input: string): Promise<number[]> {
   try {
     response = await fetch(`${embeddingBaseUrl(env)}/embeddings`, {
       method: 'POST',
-      headers: openAiHeaders(env.OPENAI_API_KEY),
+      headers: openAiHeaders(env.EMBEDDING_API_KEY),
       body: JSON.stringify({ model: env.EMBEDDING_MODEL, input }),
     });
   } catch (error) {
@@ -82,7 +82,7 @@ export async function extractMemories(env: Env, request: AddMemoryRequest): Prom
   try {
     response = await fetch(`${extractionBaseUrl(env)}/chat/completions`, {
       method: 'POST',
-      headers: openAiHeaders(env.OPENAI_API_KEY),
+      headers: openAiHeaders(env.LLM_API_KEY),
       body: JSON.stringify({
         model: env.LLM_MODEL,
         response_format: { type: 'json_object' },

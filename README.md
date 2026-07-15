@@ -45,12 +45,12 @@ All `/v1/*` routes require `Authorization: Bearer $MEM0_API_KEY`. The dashboard 
 
 - **Extraction model:** `gpt-4o-mini` (`LLM_MODEL`)
 - **Embedding model:** `text-embedding-3-small` (`EMBEDDING_MODEL`)
-- **Extraction endpoint:** `https://openrouter.ai/api/v1` by default (`LLM_API_BASE_URL`)
-- **Embedding endpoint:** `https://openrouter.ai/api/v1` by default (`EMBEDDING_API_BASE_URL`)
+- **Extraction endpoint:** `https://openrouter.ai/api/v1` by default (`LLM_API_BASE_URL`), authenticated with `LLM_API_KEY`
+- **Embedding endpoint:** `https://openrouter.ai/api/v1` by default (`EMBEDDING_API_BASE_URL`), authenticated with `EMBEDDING_API_KEY`
 
 Graph reflection uses separate Worker variables: `GRAPH_LLM_API_BASE_URL` (default `https://openrouter.ai/api/v1`), `GRAPH_LLM_MODEL` (default `deepseek/deepseek-v4-flash`), and `GRAPH_LLM_THINKING_LEVEL` (default `low`). Set `GRAPH_LLM_API_KEY` as a Cloudflare secret; it is intentionally not a `wrangler.toml` variable. Thinking levels `disabled`, `low`, `medium`, and `high` map to OpenRouter's `reasoning` object: `disabled` sends `{ "enabled": false }`, while the other values send `{ "effort": "low" | "medium" | "high" }`. Graph reflection currently only adapts the OpenRouter endpoint.
 
-Both endpoints are configured independently and must implement the OpenAI-compatible `/chat/completions` or `/embeddings` path respectively. Base URLs may include `/v1`; trailing slashes are ignored.
+Both endpoints and their credentials are configured independently and must implement the OpenAI-compatible `/chat/completions` or `/embeddings` path respectively. Base URLs may include `/v1`; trailing slashes are ignored. When both endpoints use the same provider, the same provider key may be stored in both secrets; keeping the bindings separate lets either endpoint move to a different provider later.
 
 ### Hermes compatibility
 
@@ -241,7 +241,8 @@ npm install
 Create `.dev.vars` (do not commit it):
 
 ```dotenv
-OPENAI_API_KEY=replace-me
+LLM_API_KEY=replace-with-the-extraction-provider-key
+EMBEDDING_API_KEY=replace-with-the-embedding-provider-key
 MEM0_API_KEY=replace-with-a-long-random-api-key
 DASHBOARD_PASSWORD=replace-with-a-strong-dashboard-password
 ```
@@ -332,11 +333,14 @@ npm run typecheck
 6. Set deployment secrets. Use strong, distinct values for the service API key and dashboard password:
 
    ```sh
-   npx wrangler secret put OPENAI_API_KEY
+   npx wrangler secret put LLM_API_KEY
+   npx wrangler secret put EMBEDDING_API_KEY
    npx wrangler secret put MEM0_API_KEY
    npx wrangler secret put DASHBOARD_PASSWORD
    npx wrangler secret put GRAPH_LLM_API_KEY
    ```
+
+For an existing deployment, create both `LLM_API_KEY` and `EMBEDDING_API_KEY` before deploying this version. If both providers are OpenRouter, enter the same OpenRouter key for both. The legacy `OPENAI_API_KEY` is no longer read and can be removed after the deployment succeeds.
 
 `EMBEDDING_MODEL` and `LLM_MODEL` are runtime settings. `VECTOR_DIMENSIONS` and `MEM0_INDEX_NAME` document the deployment convention; the effective Vectorize resource is the `[[vectorize]]` binding, and its dimensions must match the embedding model response.
 

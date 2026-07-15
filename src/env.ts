@@ -33,7 +33,8 @@ export interface Env {
   VECTORIZE: VectorizeIndex;
   ENTITY_VECTORIZE: VectorizeIndex;
   MEMORY_JOBS: Queue<MemoryJob>;
-  OPENAI_API_KEY: string;
+  LLM_API_KEY: string;
+  EMBEDDING_API_KEY: string;
   MEM0_API_KEY: string;
   DASHBOARD_PASSWORD: string;
   DASHBOARD_READ_ONLY?: string;
