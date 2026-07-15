@@ -21,13 +21,14 @@ type DashboardEntityType = 'user' | 'agent';
 
 export const dashboardRoutes = new Hono<{ Bindings: Env }>();
 
-const SESSION_COOKIE_NAME = '__Host-dashboard-session';
+const SECURE_SESSION_COOKIE_NAME = '__Host-dashboard-session';
+const LOCAL_SESSION_COOKIE_NAME = 'dashboard-session';
 const SESSION_TTL_SECONDS = 15 * 60;
 const encoder = new TextEncoder();
 
 dashboardRoutes.get('/', async (context) => {
   const password = context.req.header('x-dashboard-password') ?? '';
-  const hasSession = await hasValidDashboardSession(context.req.header('Cookie'), context.env.DASHBOARD_PASSWORD);
+  const hasSession = await hasValidDashboardSession(context.req.header('Cookie'), context.env.DASHBOARD_PASSWORD, context.req.url);
   if (!hasSession && !checkDashboardPassword(password, context.env)) return context.html(renderDashboardLogin(), 401);
   return context.html(renderDashboard(context.env.DASHBOARD_READ_ONLY === 'true'));
 });
@@ -39,17 +40,18 @@ dashboardRoutes.post('/login', async (context) => {
     return context.html(renderDashboardLogin(), 401);
   }
 
-  context.header('Set-Cookie', await createDashboardSessionCookie(context.env.DASHBOARD_PASSWORD));
+  context.header('Set-Cookie', await createDashboardSessionCookie(context.env.DASHBOARD_PASSWORD, context.req.url));
   return context.redirect('/dashboard', 303);
 });
 
 dashboardRoutes.post('/logout', (context) => {
-  context.header('Set-Cookie', `${SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict`);
+  const secure = isSecureDashboardRequest(context.req.url);
+  context.header('Set-Cookie', `${dashboardSessionCookieName(secure)}=; Max-Age=0; Path=/; HttpOnly${secure ? '; Secure' : ''}; SameSite=Strict`);
   return context.redirect('/dashboard', 303);
 });
 
 dashboardRoutes.use('/api/*', async (context, next) => {
-  if (!await hasValidDashboardSession(context.req.header('Cookie'), context.env.DASHBOARD_PASSWORD)) {
+  if (!await hasValidDashboardSession(context.req.header('Cookie'), context.env.DASHBOARD_PASSWORD, context.req.url)) {
     return context.json({ error: 'Unauthorized' }, 401);
   }
   await next();
@@ -149,10 +151,11 @@ dashboardRoutes.get('/api/graph', async (context) => {
   return context.json({ entities, relationships });
 });
 
-async function createDashboardSessionCookie(password: string): Promise<string> {
+async function createDashboardSessionCookie(password: string, requestUrl: string): Promise<string> {
   const expiresAt = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
   const signature = await signSessionExpiry(expiresAt, password);
-  return `${SESSION_COOKIE_NAME}=${expiresAt}.${signature}; Max-Age=${SESSION_TTL_SECONDS}; Path=/; HttpOnly; Secure; SameSite=Strict`;
+  const secure = isSecureDashboardRequest(requestUrl);
+  return `${dashboardSessionCookieName(secure)}=${expiresAt}.${signature}; Max-Age=${SESSION_TTL_SECONDS}; Path=/; HttpOnly${secure ? '; Secure' : ''}; SameSite=Strict`;
 }
 
 function dashboardScope(entityType: unknown, entityId: unknown, legacyUserId: unknown): { entityType: DashboardEntityType; entityId: string } | undefined {
@@ -169,8 +172,8 @@ function dashboardMutationReadOnlyError(env: Env): { error: string } | undefined
     : undefined;
 }
 
-async function hasValidDashboardSession(cookieHeader: string | undefined, password: string): Promise<boolean> {
-  const value = readCookie(cookieHeader, SESSION_COOKIE_NAME);
+async function hasValidDashboardSession(cookieHeader: string | undefined, password: string, requestUrl: string): Promise<boolean> {
+  const value = readCookie(cookieHeader, dashboardSessionCookieName(isSecureDashboardRequest(requestUrl)));
   const match = value?.match(/^(\d+)\.([A-Za-z0-9_-]+)$/);
   if (match === undefined || match === null || password === '') return false;
 
@@ -183,6 +186,14 @@ async function hasValidDashboardSession(cookieHeader: string | undefined, passwo
   } catch {
     return false;
   }
+}
+
+function isSecureDashboardRequest(requestUrl: string): boolean {
+  return new URL(requestUrl).protocol === 'https:';
+}
+
+function dashboardSessionCookieName(secure: boolean): string {
+  return secure ? SECURE_SESSION_COOKIE_NAME : LOCAL_SESSION_COOKIE_NAME;
 }
 
 async function signSessionExpiry(expiresAt: number, password: string): Promise<string> {

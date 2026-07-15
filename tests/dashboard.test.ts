@@ -148,6 +148,42 @@ describe('GET /dashboard', () => {
 });
 
 describe('dashboard login', () => {
+  it('omits Secure for local HTTP login sessions while retaining it for HTTPS', async () => {
+    const localLogin = await worker.fetch(new Request('http://127.0.0.1/dashboard/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'password=dashboard-secret',
+    }), env);
+    const httpsLogin = await worker.fetch(request('/dashboard/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'password=dashboard-secret',
+    }), env);
+
+    const localCookie = localLogin.headers.get('Set-Cookie')!;
+    expect(localLogin.status).toBe(303);
+    expect(localCookie).toMatch(/^dashboard-session=/);
+    expect(localCookie).not.toContain('Secure');
+    expect(httpsLogin.status).toBe(303);
+    expect(httpsLogin.headers.get('Set-Cookie')).toContain('Secure');
+
+    const localDashboard = await worker.fetch(new Request('http://127.0.0.1/dashboard', {
+      headers: { Cookie: localCookie.split(';', 1)[0] },
+    }), env);
+    const localApi = await worker.fetch(new Request('http://127.0.0.1/dashboard/api/users', {
+      headers: { Cookie: localCookie.split(';', 1)[0] },
+    }), env);
+    const localLogout = await worker.fetch(new Request('http://127.0.0.1/dashboard/logout', {
+      method: 'POST',
+    }), env);
+
+    expect(localDashboard.status).toBe(200);
+    expect(localApi.status).not.toBe(401);
+    expect(localLogout.status).toBe(303);
+    expect(localLogout.headers.get('Set-Cookie')).toMatch(/^dashboard-session=;/);
+    expect(localLogout.headers.get('Set-Cookie')).not.toContain('Secure');
+  });
+
   it('issues an HttpOnly secure session cookie that enables a browser follow-up request', async () => {
     const login = await worker.fetch(request('/dashboard/login', {
       method: 'POST',
