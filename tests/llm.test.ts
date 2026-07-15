@@ -247,6 +247,20 @@ describe('reflectWithGraphModel', () => {
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({ reasoning_effort: 'high' });
   });
 
+  it('sets a 20,000 ms graph reflection deadline', async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: 'Benoit is connected to Ada.', uncertainty: 'medium', evidence_ids: ['memory-1'],
+      }) } }] }), { status: 200 }),
+    ));
+
+    await reflectWithGraphModel(graphEnv, input);
+
+    expect(timeoutSpy).toHaveBeenCalledWith(20_000);
+    timeoutSpy.mockRestore();
+  });
+
   it.each([
     ['GRAPH_LLM_API_BASE_URL', { ...graphEnv, GRAPH_LLM_API_BASE_URL: undefined }],
     ['GRAPH_LLM_MODEL', { ...graphEnv, GRAPH_LLM_MODEL: undefined }],
