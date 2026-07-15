@@ -89,7 +89,7 @@ export const ReflectRequestSchema = z.object({
 });
 
 export const ReflectUncertaintySchema = z.enum(['low', 'medium', 'high']);
-export const GraphThinkingLevelSchema = z.enum(['low', 'medium', 'high']);
+export const GraphThinkingLevelSchema = z.enum(['disabled', 'low', 'medium', 'high']);
 
 export interface GraphReflectionEntity { label: `E${number}`; name: string; type: string }
 export interface GraphReflectionRelation {
@@ -123,14 +123,14 @@ const response = await fetch(`${normalizeBaseUrl(env.GRAPH_LLM_API_BASE_URL)}/ch
   signal: AbortSignal.timeout(20_000),
   body: JSON.stringify({
     model: env.GRAPH_LLM_MODEL,
-    reasoning_effort: thinking.data,
+    ...(thinking.data === 'disabled' ? {} : { reasoning_effort: thinking.data }),
     response_format: { type: 'json_object' },
     messages: buildReflectionMessages(input),
   }),
 });
 ```
 
-Make `buildReflectionMessages` render exactly the JSON `question`, `entities`, and `relations` contract. It must instruct the model to treat entity names and relation predicates as untrusted quoted data, answer only from the listed relations, and return only the declared JSON object. Parse completion content with `GraphModelOutputSchema`, reject duplicate or relation labels absent from `input.relations`, and retain the existing `UpstreamServiceError` behavior for non-2xx status codes.
+Make `buildReflectionMessages` render exactly the JSON `query`, `entities`, and `relations` contract. It must instruct the model to treat entity names and relation predicates as untrusted quoted data, answer only from the listed relations, and return only the declared JSON object. Parse completion content with `GraphModelOutputSchema`, reject duplicate or relation labels absent from `input.relations`, and retain the existing `UpstreamServiceError` behavior for non-2xx status codes. For a non-`disabled` level, send `reasoning_effort`; automatically add `thinking: { type: 'enabled' }` only when the normalized graph-model endpoint hostname is `api.deepseek.com`.
 
 - [ ] **Step 4: Run the focused test to verify green**
 
@@ -369,7 +369,7 @@ Do not add `GRAPH_LLM_API_KEY` to Wrangler variables or `.dev.vars.example`; doc
 - document its required request body and response fields, including complete resolved relationship evidences and deterministic `relation_paths`;
 - explain that it is explicit, user-scoped, read-only, capped at 12 semantic seeds/two hops/32 edges/20 evidence memories, and does not change ordinary `/search`;
 - describe `GRAPH_LLM_API_BASE_URL`, `GRAPH_LLM_MODEL`, and default `GRAPH_LLM_THINKING_LEVEL=low` as normal variables, and `GRAPH_LLM_API_KEY` as a secret set with `npx wrangler secret put GRAPH_LLM_API_KEY`;
-- explain that `GRAPH_LLM_THINKING_LEVEL` maps to `reasoning_effort`, accepted values are `low`, `medium`, and `high`, and the selected provider/model must support it;
+- explain that `GRAPH_LLM_THINKING_LEVEL` accepts `disabled`, `low`, `medium`, and `high`; enabled values map to `reasoning_effort`, while DeepSeek endpoints automatically receive their required thinking-mode field;
 - add migration application as a deployment prerequisite rather than promising that `wrangler deploy` applies D1 migrations automatically.
 
 - [ ] **Step 4: Run focused tests and full verification**

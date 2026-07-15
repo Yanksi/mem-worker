@@ -42,11 +42,15 @@ One LLM request is allowed, with a 20-second timeout. Reflection uses a
 dedicated, explicitly configured OpenAI-compatible model: `GRAPH_LLM_API_BASE_URL`,
 `GRAPH_LLM_MODEL`, and `GRAPH_LLM_API_KEY`. These three bindings are a group;
 the endpoint returns a clear configuration error when any member is missing.
-`GRAPH_LLM_THINKING_LEVEL` is an optional `low`, `medium`, or `high` variable;
-it defaults to `low` and is sent to the provider as `reasoning_effort` for this
-reflection request only. It does not silently fall back to the extraction
-model, because reflection is a distinct workload with its own cost and quality
-requirements. Providers and models must support `reasoning_effort`; an
+`GRAPH_LLM_THINKING_LEVEL` is an optional `disabled`, `low`, `medium`, or
+`high` variable; it defaults to `low`. `disabled` sends no reasoning controls.
+The other values are sent as `reasoning_effort` for this reflection request
+only. For the DeepSeek OpenAI-compatible endpoint (`api.deepseek.com`), an
+enabled level also automatically sends `thinking: {"type":"enabled"}` as
+required by its V4 thinking mode; other providers do not receive that
+DeepSeek-specific field. Reflection does not silently fall back to the
+extraction model, because it is a distinct workload with its own cost and
+quality requirements. Providers and models must support `reasoning_effort`; an
 unsupported parameter or value is surfaced as a clear upstream configuration
 failure rather than silently being ignored.
 
@@ -55,7 +59,7 @@ an ephemeral, request-local JSON graph contract from the bounded traversal:
 
 ```json
 {
-  "question": "<query>",
+  "query": "<query>",
   "entities": [{ "ref": "E1", "name": "<entity name>", "type": "<entity type>" }],
   "relations": [{ "ref": "R1", "source": "E1", "predicate": "<relation type>", "target": "E2", "confidence": 0.9 }]
 }
@@ -72,10 +76,12 @@ response mode:
 }
 ```
 
-The Worker Zod-validates the JSON shape, a non-empty result, and a non-empty
-set of known `R*` labels. It rejects extra fields, duplicate or unknown labels,
-and malformed output. The Worker then maps the selected labels back to complete
-relationship/entity/source-memory records.
+The Worker Zod-validates the JSON shape, a non-empty result, and a set of known
+`R*` labels. Empty `evidence_relation_refs` is allowed only to express that the
+supplied graph cannot answer the question; it produces a high-uncertainty
+response with no resolved evidence. The Worker rejects extra fields, duplicate
+or unknown labels, and malformed output. It maps selected labels back to
+complete relationship/entity/source-memory records.
 It derives `uncertainty` from whether valid graph evidence was selected; the
 model does not control evidence structure, database identifiers, tenant scope,
 or graph queries.
