@@ -3,13 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.9.0"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "dev:remote-readonly": "wrangler dev --config wrangler.remote-preview.toml --var DASHBOARD_READ_ONLY:true",
     "deploy": "wrangler deploy",
     "test": "vitest run --exclude scripts/lib/memory-deduplication.test.mjs",
     "test:maintenance": "node --test scripts/lib/memory-deduplication.test.mjs",
-    "maintenance:dedup": "node --env-file=.env scripts/migrate-memory-deduplication.mjs",
+    "maintenance:dedup": "node --env-file-if-exists=.env scripts/migrate-memory-deduplication.mjs",
     "test:watch": "vitest --exclude scripts/lib/memory-deduplication.test.mjs",
     "typecheck": "tsc --noEmit"
   },

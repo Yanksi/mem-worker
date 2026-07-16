@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -158,6 +159,178 @@ function successfulD1Result(results = [], changes = 0) {
   return [{ success: true, results, meta: { changes } }];
 }
 
+async function createStatefulMaintenanceFake(failurePhase) {
+  const rows = [
+    {
+      id: 'canonical',
+      user_id: 'user-1',
+      agent_id: null,
+      content: 'same',
+      content_hash: null,
+      created_at: 1,
+      deleted_at: null,
+    },
+    {
+      id: 'loser',
+      user_id: 'user-1',
+      agent_id: null,
+      content: 'same',
+      content_hash: null,
+      created_at: 2,
+      deleted_at: null,
+    },
+    {
+      id: 'other',
+      user_id: null,
+      agent_id: 'agent-1',
+      content: 'other',
+      content_hash: null,
+      created_at: 3,
+      deleted_at: null,
+    },
+  ];
+  const vectors = new Map(rows.map((row) => [
+    row.id,
+    { id: row.id, metadata: { scope_key: 'stale' } },
+  ]));
+  const stats = {
+    hashCommits: 0,
+    cleanupCommits: 0,
+    vectorDeleteSubmissions: [],
+    reindexSuccesses: [],
+  };
+  let pendingFailure = failurePhase;
+  let loginCount = 0;
+  let reindexAttemptCount = 0;
+
+  const failOnce = (phase) => {
+    if (pendingFailure !== phase) return;
+    pendingFailure = undefined;
+    throw new Error(`injected ${phase}`);
+  };
+
+  const fetchImpl = async (url, init = {}) => {
+    if (url.includes('/d1/database/')) {
+      const body = JSON.parse(init.body);
+      if (body.sql !== undefined) {
+        return jsonResponse({ success: true, result: successfulD1Result(rows) });
+      }
+
+      if (body.batch?.[0]?.sql.includes('SET content_hash')) {
+        for (const statement of body.batch) {
+          const [hash, id, content] = statement.params;
+          const row = rows.find((candidate) => candidate.id === id);
+          if (row?.content === content && row.content_hash !== hash) row.content_hash = hash;
+        }
+        stats.hashCommits += 1;
+        failOnce('after-hash-commit');
+        return jsonResponse({
+          success: true,
+          result: body.batch.map(() => ({ success: true, results: [], meta: { changes: 1 } })),
+        });
+      }
+
+      if (body.batch?.[2]?.sql.includes('SET deleted_at = unixepoch()')) {
+        const [loserId, canonicalId] = body.batch[2].params;
+        const loser = rows.find((row) => row.id === loserId);
+        const canonical = rows.find((row) => row.id === canonicalId);
+        const decisive = loser?.deleted_at === null
+          && canonical?.deleted_at === null
+          && loser.user_id === canonical.user_id
+          && loser.agent_id === canonical.agent_id
+          && loser.content_hash === canonical.content_hash
+          && loser.content === canonical.content;
+        if (decisive) {
+          loser.deleted_at = 100;
+          stats.cleanupCommits += 1;
+        }
+        failOnce('after-d1-cleanup');
+        return jsonResponse({
+          success: true,
+          result: [
+            { success: true, results: [], meta: { changes: 0 } },
+            { success: true, results: [], meta: { changes: 0 } },
+            {
+              success: true,
+              results: decisive ? [{ id: loserId }] : [],
+              meta: { changes: decisive ? 1 : 0 },
+            },
+          ],
+        });
+      }
+
+      throw new Error('unexpected D1 request');
+    }
+
+    if (url.endsWith('/delete_by_ids')) {
+      const { ids } = JSON.parse(init.body);
+      stats.vectorDeleteSubmissions.push([...ids]);
+      for (const id of ids) vectors.delete(id);
+      failOnce('after-vector-deletion-submission');
+      return jsonResponse({ success: true, result: { mutationId: 'mutation-1' } });
+    }
+
+    if (url.endsWith('/get_by_ids')) {
+      const { ids } = JSON.parse(init.body);
+      return jsonResponse({
+        success: true,
+        result: ids.flatMap((id) => vectors.has(id) ? [vectors.get(id)] : []),
+      });
+    }
+
+    if (url.endsWith('/dashboard/login')) {
+      loginCount += 1;
+      return new Response(null, {
+        status: 303,
+        headers: { 'Set-Cookie': `session=session-${loginCount}; Path=/; HttpOnly; Secure` },
+      });
+    }
+
+    const reindexMatch = url.match(/\/dashboard\/api\/memories\/([^/]+)\/reindex$/);
+    if (reindexMatch !== null) {
+      reindexAttemptCount += 1;
+      if (pendingFailure === 'during-partial-reindex' && reindexAttemptCount === 2) {
+        failOnce('during-partial-reindex');
+      }
+      const id = decodeURIComponent(reindexMatch[1]);
+      const row = rows.find((candidate) => candidate.id === id);
+      assert.ok(row);
+      vectors.set(id, { id, metadata: { scope_key: await scopeKey(row) } });
+      stats.reindexSuccesses.push(id);
+      return jsonResponse({ ok: true });
+    }
+
+    throw new Error(`unexpected request: ${url}`);
+  };
+
+  return { rows, vectors, stats, fetchImpl };
+}
+
+function statefulMaintenanceOptions(fake, logs, errors) {
+  return {
+    env: {
+      CLOUDFLARE_API_TOKEN: 'cloudflare-secret',
+      CLOUDFLARE_ACCOUNT_ID: 'account-1',
+      DASHBOARD_PASSWORD: 'dashboard-secret',
+      MEM0_BASE_URL: 'https://mem0.example',
+    },
+    readFileImpl: async () => `
+      [[d1_databases]]
+      binding = "DB"
+      database_id = "database-1"
+
+      [[vectorize]]
+      binding = "VECTORIZE"
+      index_name = "memory-index"
+    `,
+    fetchImpl: fake.fetchImpl,
+    logger: {
+      log: (message) => logs.push(message),
+      error: (message) => errors.push(message),
+    },
+  };
+}
+
 test('parseArguments accepts only the documented commands and confirmation flag', () => {
   assert.deepEqual(parseArguments(['inspect']), { command: 'inspect', confirm: false });
   assert.deepEqual(parseArguments(['apply', '--confirm']), { command: 'apply', confirm: true });
@@ -178,6 +351,25 @@ test('the executable rejects apply without confirmation before environment acces
   assert.notEqual(result.status, 0);
   assert.equal(result.stdout, '');
   assert.equal(result.stderr.trim(), 'apply requires --confirm');
+});
+
+test('the npm maintenance launcher reaches the confirmation guard without an env file', () => {
+  const cwd = fileURLToPath(new URL('../..', import.meta.url));
+  const packageJson = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8'));
+  assert.equal(packageJson.engines.node, '>=22.9.0');
+
+  const command = process.platform === 'win32'
+    ? [process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'npm run maintenance:dedup -- apply']]
+    : ['npm', ['run', 'maintenance:dedup', '--', 'apply']];
+  const result = spawnSync(command[0], command[1], {
+    cwd,
+    encoding: 'utf8',
+    env: process.env,
+  });
+
+  assert.notEqual(result.status, 0);
+  const stderrLines = result.stderr.split(/\r?\n/).filter((line) => line !== '');
+  assert.equal(stderrLines.at(-1), 'apply requires --confirm');
 });
 
 test('main returns nonzero for unconfirmed apply without reading config or fetching', async () => {
@@ -377,15 +569,35 @@ test('inspect is read-only and writes a deterministic backup without configured 
       fetchCalls.push({ url, init });
       return jsonResponse({
         success: true,
-        result: successfulD1Result([{
-          id: 'memory-1',
-          user_id: 'user-1',
-          agent_id: null,
-          content: 'safe content',
-          content_hash: await contentHash('safe content'),
-          created_at: 1,
-          deleted_at: null,
-        }]),
+        result: successfulD1Result([
+          {
+            id: 'memory-1',
+            user_id: 'user-1',
+            agent_id: null,
+            content: 'safe content',
+            content_hash: await contentHash('safe content'),
+            created_at: 1,
+            deleted_at: null,
+          },
+          {
+            id: 'memory-2',
+            user_id: 'user-1',
+            agent_id: null,
+            content: 'safe content',
+            content_hash: await contentHash('safe content'),
+            created_at: 2,
+            deleted_at: null,
+          },
+          {
+            id: 'ownerless',
+            user_id: null,
+            agent_id: null,
+            content: 'cannot reindex',
+            content_hash: await contentHash('cannot reindex'),
+            created_at: 3,
+            deleted_at: null,
+          },
+        ]),
       });
     },
     mkdirImpl: async () => undefined,
@@ -400,9 +612,202 @@ test('inspect is read-only and writes a deterministic backup without configured 
   assert.match(JSON.parse(fetchCalls[0].init.body).sql, /ORDER BY created_at ASC, id ASC/i);
   assert.equal(writes.length, 1);
   assert.equal(writes[0][0], join('backups', 'memory-deduplication-2026-07-16T12-34-56.000Z.json'));
+  assert.deepEqual(writes[0][2], { encoding: 'utf8', mode: 0o600, flag: 'wx' });
   assert.doesNotMatch(writes[0][1], /cloudflare-secret|dashboard-secret/);
+  const backup = JSON.parse(writes[0][1]);
+  assert.deepEqual(backup.report.active_duplicate_loser_ids, ['memory-2']);
+  assert.equal(backup.report.active_duplicate_loser_count, 1);
+  assert.deepEqual(backup.report.unreindexable_active_memory_ids, ['ownerless']);
+  assert.equal(backup.report.unreindexable_active_memory_count, 1);
   assert.match(logs[0], /"command": "inspect"/);
   assert.doesNotMatch(logs[0], /cloudflare-secret|dashboard-secret/);
+});
+
+test('inspect never retries or overwrites an existing backup path', async () => {
+  let writeAttempts = 0;
+  const errors = [];
+  const exitCode = await main(['inspect'], {
+    env: {
+      CLOUDFLARE_API_TOKEN: 'cloudflare-secret',
+      CLOUDFLARE_ACCOUNT_ID: 'account-1',
+      DASHBOARD_PASSWORD: 'dashboard-secret',
+      MEM0_BASE_URL: 'https://mem0.example',
+    },
+    readFileImpl: async () => `
+      [[d1_databases]]
+      binding = "DB"
+      database_id = "database-1"
+
+      [[vectorize]]
+      binding = "VECTORIZE"
+      index_name = "memory-index"
+    `,
+    fetchImpl: async () => jsonResponse({
+      success: true,
+      result: successfulD1Result([]),
+    }),
+    mkdirImpl: async () => undefined,
+    writeFileImpl: async () => {
+      writeAttempts += 1;
+      const error = new Error('backup already exists');
+      error.code = 'EEXIST';
+      throw error;
+    },
+    now: () => new Date('2026-07-16T12:34:56.000Z'),
+    logger: { log: assert.fail, error: (message) => errors.push(message) },
+  });
+
+  assert.equal(exitCode, 1);
+  assert.equal(writeAttempts, 1);
+  assert.deepEqual(errors, ['backup already exists']);
+});
+
+test('apply preflight rejects unreindexable active memories before auth or mutation', async () => {
+  const calls = [];
+  const errors = [];
+  const exitCode = await main(['apply', '--confirm'], {
+    env: {
+      CLOUDFLARE_API_TOKEN: 'cloudflare-secret',
+      CLOUDFLARE_ACCOUNT_ID: 'account-1',
+      DASHBOARD_PASSWORD: 'dashboard-secret',
+      MEM0_BASE_URL: 'https://mem0.example',
+    },
+    readFileImpl: async () => `
+      [[d1_databases]]
+      binding = "DB"
+      database_id = "database-1"
+
+      [[vectorize]]
+      binding = "VECTORIZE"
+      index_name = "memory-index"
+    `,
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init });
+      return jsonResponse({
+        success: true,
+        result: successfulD1Result([{
+          id: 'ownerless',
+          user_id: null,
+          agent_id: null,
+          content: 'cannot reindex',
+          content_hash: null,
+          created_at: 1,
+          deleted_at: null,
+        }, {
+          id: 'whitespace-owner',
+          user_id: '   ',
+          agent_id: null,
+          content: 'also cannot reindex',
+          content_hash: null,
+          created_at: 2,
+          deleted_at: null,
+        }]),
+      });
+    },
+    logger: { log: assert.fail, error: (message) => errors.push(message) },
+  });
+
+  assert.equal(exitCode, 1);
+  assert.deepEqual(errors, [
+    'apply preflight found 2 unreindexable active memories: ownerless, whitespace-owner',
+  ]);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\/d1\/database\/database-1\/query$/);
+  assert.equal(JSON.parse(calls[0].init.body).batch, undefined);
+});
+
+test('apply authenticates Dashboard before the first D1 or Vectorize mutation', async () => {
+  const row = {
+    id: 'ready',
+    user_id: 'user-1',
+    agent_id: null,
+    content: 'ready',
+    content_hash: await contentHash('ready'),
+    created_at: 1,
+    deleted_at: null,
+  };
+  const calls = [];
+  const errors = [];
+  const exitCode = await main(['apply', '--confirm'], {
+    env: {
+      CLOUDFLARE_API_TOKEN: 'cloudflare-secret',
+      CLOUDFLARE_ACCOUNT_ID: 'account-1',
+      DASHBOARD_PASSWORD: 'dashboard-secret',
+      MEM0_BASE_URL: 'https://mem0.example',
+    },
+    readFileImpl: async () => `
+      [[d1_databases]]
+      binding = "DB"
+      database_id = "database-1"
+
+      [[vectorize]]
+      binding = "VECTORIZE"
+      index_name = "memory-index"
+    `,
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init });
+      if (url.endsWith('/dashboard/login')) return jsonResponse({ error: 'Unauthorized' }, 401);
+      return jsonResponse({ success: true, result: successfulD1Result([row]) });
+    },
+    logger: { log: assert.fail, error: (message) => errors.push(message) },
+  });
+
+  assert.equal(exitCode, 1);
+  assert.deepEqual(errors, ['Dashboard login failed: HTTP 401']);
+  assert.deepEqual(calls.map(({ url }) => url), [
+    'https://api.cloudflare.com/client/v4/accounts/account-1/d1/database/database-1/query',
+    'https://mem0.example/dashboard/login',
+  ]);
+  assert.equal(JSON.parse(calls[0].init.body).batch, undefined);
+});
+
+test('confirmed apply resumes after every committed phase and converges idempotently', async (t) => {
+  const scenarios = [
+    'after-hash-commit',
+    'after-d1-cleanup',
+    'after-vector-deletion-submission',
+    'during-partial-reindex',
+  ];
+
+  for (const failurePhase of scenarios) {
+    await t.test(failurePhase, async () => {
+      const fake = await createStatefulMaintenanceFake(failurePhase);
+      const logs = [];
+      const errors = [];
+      const options = statefulMaintenanceOptions(fake, logs, errors);
+
+      assert.equal(await main(['apply', '--confirm'], options), 1);
+      assert.match(errors.at(-1), new RegExp(`injected ${failurePhase}`));
+      assert.equal(await main(['apply', '--confirm'], options), 0);
+      assert.equal(await main(['verify'], options), 0);
+
+      const canonical = fake.rows.find(({ id }) => id === 'canonical');
+      const loser = fake.rows.find(({ id }) => id === 'loser');
+      const other = fake.rows.find(({ id }) => id === 'other');
+      assert.equal(canonical.content_hash, await contentHash(canonical.content));
+      assert.equal(loser.content_hash, await contentHash(loser.content));
+      assert.equal(other.content_hash, await contentHash(other.content));
+      assert.equal(loser.deleted_at, 100);
+      assert.deepEqual([...fake.vectors.keys()].sort(), ['canonical', 'other']);
+      assert.equal(fake.vectors.get('canonical').metadata.scope_key, await scopeKey(canonical));
+      assert.equal(fake.vectors.get('other').metadata.scope_key, await scopeKey(other));
+      assert.equal(fake.stats.hashCommits, 1);
+      assert.equal(fake.stats.cleanupCommits, 1);
+      assert.ok(fake.stats.vectorDeleteSubmissions.length >= 1);
+      assert.ok(fake.stats.vectorDeleteSubmissions.length <= 2);
+      assert.ok(fake.stats.vectorDeleteSubmissions.every((ids) => (
+        ids.length === 1 && ids[0] === 'loser'
+      )));
+
+      const verifyLog = JSON.parse(logs.at(-1));
+      assert.equal(verifyLog.command, 'verify');
+      assert.equal(verifyLog.ok, true);
+      assert.equal(verifyLog.report.unexpected_deleted_vector_count, 0);
+      if (failurePhase === 'during-partial-reindex') {
+        assert.deepEqual(fake.stats.reindexSuccesses, ['canonical', 'canonical', 'other']);
+      }
+    });
+  }
 });
 
 test('applyHashUpdates sends bounded parameterized D1 batches with raw content only in params', async () => {
@@ -495,14 +900,17 @@ test('Dashboard login captures the session cookie and reindex preserves each act
     password: 'dashboard-secret',
     fetchImpl,
   });
+  const session = { cookie };
   const result = await reindexActiveMemories({
     baseUrl: 'https://mem0.example',
-    cookie,
+    session,
+    password: 'dashboard-secret',
     fetchImpl,
     rows: [
       { id: 'user', user_id: 'u', agent_id: null, deleted_at: null },
       { id: 'agent', user_id: null, agent_id: 'a', deleted_at: null },
       { id: 'paired', user_id: 'u', agent_id: 'a', deleted_at: null },
+      { id: 'agent-fallback', user_id: '   ', agent_id: 'a2', deleted_at: null },
       { id: 'deleted', user_id: 'u', agent_id: null, deleted_at: 1 },
     ],
   });
@@ -530,15 +938,21 @@ test('Dashboard login captures the session cookie and reindex preserves each act
       cookie,
       body: { entity_type: 'user', entity_id: 'u' },
     },
+    {
+      url: 'https://mem0.example/dashboard/api/memories/agent-fallback/reindex',
+      cookie,
+      body: { entity_type: 'agent', entity_id: 'a2' },
+    },
   ]);
-  assert.deepEqual(result, { reindexed: 3 });
+  assert.deepEqual(result, { reindexed: 4 });
 });
 
 test('reindexActiveMemories fails clearly for an active ownerless memory before fetch', async () => {
   let fetched = false;
   await assert.rejects(reindexActiveMemories({
     baseUrl: 'https://mem0.example',
-    cookie: 'session=signed',
+    session: { cookie: 'session=signed' },
+    password: 'dashboard-secret',
     fetchImpl: async () => {
       fetched = true;
       return jsonResponse({ ok: true });
@@ -548,7 +962,108 @@ test('reindexActiveMemories fails clearly for an active ownerless memory before 
   assert.equal(fetched, false);
 });
 
-test('verifyMemoryState batches active vector reads and reports every failure category', async () => {
+test('reindexActiveMemories renews an expired session and retries only the current memory', async () => {
+  const calls = [];
+  const session = { cookie: '__Host-dashboard-session=old-session' };
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, cookie: init.headers?.Cookie });
+    if (url.endsWith('/dashboard/login')) {
+      return new Response(null, {
+        status: 303,
+        headers: { 'Set-Cookie': '__Host-dashboard-session=new-session; Path=/; HttpOnly; Secure' },
+      });
+    }
+    if (url.endsWith('/second/reindex') && init.headers.Cookie.includes('old-session')) {
+      return jsonResponse({ error: 'Unauthorized' }, 401);
+    }
+    return jsonResponse({ ok: true });
+  };
+
+  const result = await reindexActiveMemories({
+    rows: [
+      { id: 'first', user_id: 'u', agent_id: null, deleted_at: null },
+      { id: 'second', user_id: 'u', agent_id: null, deleted_at: null },
+      { id: 'third', user_id: 'u', agent_id: null, deleted_at: null },
+    ],
+    baseUrl: 'https://mem0.example',
+    session,
+    password: 'dashboard-secret',
+    fetchImpl,
+  });
+
+  assert.deepEqual(calls.map(({ url }) => url), [
+    'https://mem0.example/dashboard/api/memories/first/reindex',
+    'https://mem0.example/dashboard/api/memories/second/reindex',
+    'https://mem0.example/dashboard/login',
+    'https://mem0.example/dashboard/api/memories/second/reindex',
+    'https://mem0.example/dashboard/api/memories/third/reindex',
+  ]);
+  assert.equal(calls[0].cookie, '__Host-dashboard-session=old-session');
+  assert.equal(calls[3].cookie, '__Host-dashboard-session=new-session');
+  assert.equal(calls[4].cookie, '__Host-dashboard-session=new-session');
+  assert.equal(session.cookie, '__Host-dashboard-session=new-session');
+  assert.deepEqual(result, { reindexed: 3 });
+});
+
+test('reindexActiveMemories stops after a renewed session also receives 401', async () => {
+  const calls = [];
+  const session = { cookie: '__Host-dashboard-session=old-session' };
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, cookie: init.headers?.Cookie });
+    if (url.endsWith('/dashboard/login')) {
+      return new Response(null, {
+        status: 303,
+        headers: { 'Set-Cookie': '__Host-dashboard-session=new-session; Path=/; HttpOnly; Secure' },
+      });
+    }
+    return jsonResponse({ error: 'Unauthorized' }, 401);
+  };
+
+  await assert.rejects(reindexActiveMemories({
+    rows: [{ id: 'current', user_id: 'u', agent_id: null, deleted_at: null }],
+    baseUrl: 'https://mem0.example',
+    session,
+    password: 'dashboard-secret',
+    fetchImpl,
+  }), /Dashboard reindex failed for memory current: HTTP 401/);
+
+  assert.deepEqual(calls.map(({ url }) => url), [
+    'https://mem0.example/dashboard/api/memories/current/reindex',
+    'https://mem0.example/dashboard/login',
+    'https://mem0.example/dashboard/api/memories/current/reindex',
+  ]);
+});
+
+test('reindexActiveMemories redacts old and renewed sessions from transport errors', async () => {
+  const oldCookie = '__Host-dashboard-session=old-secret-session';
+  const newCookie = '__Host-dashboard-session=new-secret-session';
+  const session = { cookie: oldCookie };
+  let reindexAttempts = 0;
+  const fetchImpl = async (url) => {
+    if (url.endsWith('/dashboard/login')) {
+      return new Response(null, {
+        status: 303,
+        headers: { 'Set-Cookie': `${newCookie}; Path=/; HttpOnly; Secure` },
+      });
+    }
+    reindexAttempts += 1;
+    if (reindexAttempts === 1) return jsonResponse({ error: 'Unauthorized' }, 401);
+    throw new Error(`transport exposed ${oldCookie} ${newCookie} dashboard-secret`);
+  };
+
+  await assert.rejects(reindexActiveMemories({
+    rows: [{ id: 'current', user_id: 'u', agent_id: null, deleted_at: null }],
+    baseUrl: 'https://mem0.example',
+    session,
+    password: 'dashboard-secret',
+    fetchImpl,
+  }), (error) => error.message.includes('[redacted]')
+    && !error.message.includes(oldCookie)
+    && !error.message.includes(newCookie)
+    && !error.message.includes('dashboard-secret'));
+});
+
+test('verifyMemoryState batches active and deleted vector reads and reports every failure category', async () => {
   const rows = [
     { id: 'canonical', user_id: 'u', agent_id: null, content: 'same', content_hash: await contentHash('same'), created_at: 1, deleted_at: null },
     { id: 'duplicate', user_id: 'u', agent_id: null, content: 'same', content_hash: await contentHash('same'), created_at: 2, deleted_at: null },
@@ -574,7 +1089,7 @@ test('verifyMemoryState batches active vector reads and reports every failure ca
   });
 
   assert.equal(result.ok, false);
-  assert.deepEqual(calls, [['canonical', 'duplicate'], ['missing', 'wrong-scope']]);
+  assert.deepEqual(calls, [['canonical', 'duplicate'], ['missing', 'wrong-scope'], ['deleted-null']]);
   assert.deepEqual(result.report.null_hash_ids, ['missing', 'deleted-null']);
   assert.deepEqual(result.report.mismatched_hash_ids, []);
   assert.deepEqual(result.report.active_duplicate_mappings, [
@@ -584,7 +1099,10 @@ test('verifyMemoryState batches active vector reads and reports every failure ca
   assert.equal(result.report.active_duplicate_mapping_count, 1);
   assert.deepEqual(result.report.missing_active_vector_ids, ['missing']);
   assert.deepEqual(result.report.wrong_scope_key_ids, ['wrong-scope']);
+  assert.equal(result.report.unexpected_deleted_vector_count, 1);
+  assert.deepEqual(result.report.unexpected_deleted_vector_ids, ['deleted-null']);
   assert.match(result.report.operator_note, /Vectorize mutations are asynchronous/);
+  assert.match(result.report.operator_note, /deleted vectors may remain visible briefly/i);
 });
 
 test('verifyMemoryState succeeds when hashes, exact groups, vectors, and scope metadata are complete', async () => {
@@ -597,15 +1115,25 @@ test('verifyMemoryState succeeds when hashes, exact groups, vectors, and scope m
     created_at: 1,
     deleted_at: null,
   };
+  const deletedRow = { ...row, id: 'deleted', deleted_at: 10 };
+  const calls = [];
   const result = await verifyMemoryState({
-    rows: [row],
-    getVectors: async () => [{ id: row.id, metadata: { scope_key: await scopeKey(row) } }],
+    rows: [row, deletedRow],
+    getVectors: async (ids) => {
+      calls.push(ids);
+      return ids.includes(row.id)
+        ? [{ id: row.id, metadata: { scope_key: await scopeKey(row) } }]
+        : [];
+    },
   });
 
   assert.equal(result.ok, true);
+  assert.deepEqual(calls, [['ready'], ['deleted']]);
   assert.equal(result.report.hash_issue_count, 0);
   assert.equal(result.report.active_duplicate_group_count, 0);
   assert.equal(result.report.active_duplicate_mapping_count, 0);
   assert.equal(result.report.missing_active_vector_count, 0);
   assert.equal(result.report.wrong_scope_key_count, 0);
+  assert.equal(result.report.unexpected_deleted_vector_count, 0);
+  assert.deepEqual(result.report.unexpected_deleted_vector_ids, []);
 });

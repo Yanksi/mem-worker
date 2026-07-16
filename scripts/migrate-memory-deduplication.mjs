@@ -412,7 +412,7 @@ export async function deleteVectorIds({
   return { ids: uniqueIds.length, batches: batches.length };
 }
 
-export async function loginDashboard({ baseUrl, password, fetchImpl }) {
+export async function loginDashboard({ baseUrl, password, fetchImpl, secrets = [] }) {
   const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
   let response;
   try {
@@ -423,7 +423,7 @@ export async function loginDashboard({ baseUrl, password, fetchImpl }) {
       redirect: 'manual',
     });
   } catch (error) {
-    throw new Error(`Dashboard login failed: ${redact(error?.message ?? 'network error', [password])}`);
+    throw new Error(`Dashboard login failed: ${redact(error?.message ?? 'network error', [password, ...secrets])}`);
   }
   if (response.status !== 303) throw new Error(`Dashboard login failed: HTTP ${response.status}`);
   const cookie = response.headers.get('set-cookie')?.split(';', 1)[0];
@@ -434,33 +434,64 @@ export async function loginDashboard({ baseUrl, password, fetchImpl }) {
 }
 
 function dashboardScope(row) {
-  if (typeof row.user_id === 'string' && row.user_id !== '') {
+  if (typeof row.user_id === 'string' && row.user_id.trim() !== '') {
     return { entity_type: 'user', entity_id: row.user_id };
   }
-  if (typeof row.agent_id === 'string' && row.agent_id !== '') {
+  if (typeof row.agent_id === 'string' && row.agent_id.trim() !== '') {
     return { entity_type: 'agent', entity_id: row.agent_id };
   }
   throw new Error(`active memory ${row.id} has no Dashboard-reindexable owner`);
 }
 
-export async function reindexActiveMemories({ rows, baseUrl, cookie, fetchImpl }) {
+function unreindexableActiveMemoryIds(rows) {
+  return rows
+    .filter((row) => row.deleted_at === null)
+    .filter((row) => {
+      try {
+        dashboardScope(row);
+        return false;
+      } catch {
+        return true;
+      }
+    })
+    .map((row) => row.id);
+}
+
+export async function reindexActiveMemories({ rows, baseUrl, session, password, fetchImpl }) {
   const activeRows = rows.filter((row) => row.deleted_at === null);
   const requests = activeRows.map((row) => ({ row, scope: dashboardScope(row) }));
   const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+  const secrets = new Set([password, session.cookie]);
 
-  for (const { row, scope } of requests) {
-    let response;
+  const requestReindex = async (row, scope) => {
     try {
-      response = await fetchImpl(
+      return await fetchImpl(
         `${normalizedBaseUrl}/dashboard/api/memories/${encodeURIComponent(row.id)}/reindex`,
         {
           method: 'POST',
-          headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+          headers: { Cookie: session.cookie, 'Content-Type': 'application/json' },
           body: JSON.stringify(scope),
         },
       );
     } catch (error) {
-      throw new Error(`Dashboard reindex failed for memory ${row.id}: ${error?.message ?? 'network error'}`);
+      throw new Error(
+        `Dashboard reindex failed for memory ${row.id}: ${redact(error?.message ?? 'network error', secrets)}`,
+      );
+    }
+  };
+
+  for (const { row, scope } of requests) {
+    let response = await requestReindex(row, scope);
+    if (response.status === 401) {
+      secrets.add(session.cookie);
+      session.cookie = await loginDashboard({
+        baseUrl: normalizedBaseUrl,
+        password,
+        fetchImpl,
+        secrets,
+      });
+      secrets.add(session.cookie);
+      response = await requestReindex(row, scope);
     }
     if (!response.ok) {
       throw new Error(`Dashboard reindex failed for memory ${row.id}: HTTP ${response.status}`);
@@ -485,11 +516,18 @@ export async function verifyMemoryState({
   const duplicates = duplicateMappings(rows);
   const duplicateGroupCount = new Set(duplicates.map(({ canonicalId }) => canonicalId)).size;
   const activeRows = rows.filter((row) => row.deleted_at === null);
+  const deletedRows = rows.filter((row) => row.deleted_at !== null);
   const vectors = [];
   for (const batch of chunks(activeRows.map((row) => row.id), vectorBatchSize)) {
     const result = await getVectors(batch);
     if (!Array.isArray(result)) throw new Error('Vectorize get_by_ids returned invalid vectors');
     vectors.push(...result);
+  }
+  const deletedVectors = [];
+  for (const batch of chunks(deletedRows.map((row) => row.id), vectorBatchSize)) {
+    const result = await getVectors(batch);
+    if (!Array.isArray(result)) throw new Error('Vectorize get_by_ids returned invalid vectors');
+    deletedVectors.push(...result);
   }
   const vectorsById = new Map(vectors.map((vector) => [vector.id, vector]));
   const missingVectorIds = [];
@@ -502,6 +540,10 @@ export async function verifyMemoryState({
     }
     if (vector.metadata?.scope_key !== await scopeKey(row)) wrongScopeKeyIds.push(row.id);
   }
+  const returnedDeletedIds = new Set(deletedVectors.map((vector) => vector.id));
+  const unexpectedDeletedVectorIds = deletedRows
+    .filter((row) => returnedDeletedIds.has(row.id))
+    .map((row) => row.id);
 
   const report = {
     row_count: rows.length,
@@ -516,13 +558,16 @@ export async function verifyMemoryState({
     missing_active_vector_ids: missingVectorIds,
     wrong_scope_key_count: wrongScopeKeyIds.length,
     wrong_scope_key_ids: wrongScopeKeyIds,
-    operator_note: 'Vectorize mutations are asynchronous; if verification follows apply immediately and fails, wait briefly and rerun verify.',
+    unexpected_deleted_vector_count: unexpectedDeletedVectorIds.length,
+    unexpected_deleted_vector_ids: unexpectedDeletedVectorIds,
+    operator_note: 'Vectorize mutations are asynchronous; deleted vectors may remain visible briefly. If verification follows apply immediately and fails, wait briefly and rerun verify.',
   };
   return {
     ok: report.hash_issue_count === 0
       && report.active_duplicate_group_count === 0
       && report.missing_active_vector_count === 0
-      && report.wrong_scope_key_count === 0,
+      && report.wrong_scope_key_count === 0
+      && report.unexpected_deleted_vector_count === 0,
     report,
   };
 }
@@ -531,6 +576,8 @@ async function inspectionPlan(rows) {
   const hashUpdates = await pendingHashUpdates(rows);
   const duplicates = duplicateMappings(rows);
   const activeRows = rows.filter((row) => row.deleted_at === null);
+  const duplicateLoserIds = duplicates.map(({ loserId }) => loserId);
+  const unreindexableIds = unreindexableActiveMemoryIds(rows);
   return {
     row_count: rows.length,
     active_row_count: activeRows.length,
@@ -539,6 +586,10 @@ async function inspectionPlan(rows) {
     pending_hash_updates: hashUpdates,
     active_duplicate_mapping_count: duplicates.length,
     active_duplicate_mappings: duplicates,
+    active_duplicate_loser_count: duplicateLoserIds.length,
+    active_duplicate_loser_ids: duplicateLoserIds,
+    unreindexable_active_memory_count: unreindexableIds.length,
+    unreindexable_active_memory_ids: unreindexableIds,
     active_reindex_count: activeRows.length,
   };
 }
@@ -562,7 +613,11 @@ async function writeInspectionBackup({ rows, report, config, now, mkdirImpl, wri
     report,
     rows,
   };
-  await writeFileImpl(path, `${JSON.stringify(backup, null, 2)}\n`, 'utf8');
+  await writeFileImpl(path, `${JSON.stringify(backup, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+    flag: 'wx',
+  });
   return path;
 }
 
@@ -635,6 +690,20 @@ export async function runCommand(parsed, {
   }
 
   const initialRows = await pageAllMemories(queryD1);
+  const unreindexableIds = unreindexableActiveMemoryIds(initialRows);
+  if (unreindexableIds.length > 0) {
+    const memoryLabel = unreindexableIds.length === 1 ? 'memory' : 'memories';
+    throw new Error(
+      `apply preflight found ${unreindexableIds.length} unreindexable active ${memoryLabel}: ${unreindexableIds.join(', ')}`,
+    );
+  }
+  const session = {
+    cookie: await loginDashboard({
+      baseUrl: config.mem0BaseUrl,
+      password: runtime.dashboardPassword,
+      fetchImpl,
+    }),
+  };
   const hashUpdates = await pendingHashUpdates(initialRows);
   const hashResult = await applyHashUpdates({
     rows: initialRows,
@@ -665,15 +734,11 @@ export async function runCommand(parsed, {
   const activeRows = finalRows.filter((row) => row.deleted_at === null);
   let reindexResult = { reindexed: 0 };
   if (activeRows.length > 0) {
-    const cookie = await loginDashboard({
-      baseUrl: config.mem0BaseUrl,
-      password: runtime.dashboardPassword,
-      fetchImpl,
-    });
     reindexResult = await reindexActiveMemories({
       rows: activeRows,
       baseUrl: config.mem0BaseUrl,
-      cookie,
+      session,
+      password: runtime.dashboardPassword,
       fetchImpl,
     });
   }
