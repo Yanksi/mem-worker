@@ -117,13 +117,17 @@ async function publicationCounts() {
   return [memory.results[0].count, history.results[0].count];
 }
 
-async function seedCanonicalMemory(id: string, digest: string | null = null) {
+async function seedCanonicalMemory(
+  id: string,
+  digest: string | null = null,
+  deletedAt: number | null = null,
+) {
   await env.DB.prepare(`
     INSERT INTO memories (
       id, user_id, agent_id, run_id, actor_id, content, metadata_json,
       hash, content_hash, created_at, updated_at, deleted_at
-    ) VALUES (?, 'user-1', NULL, NULL, NULL, ?, '{}', ?, ?, 1, 1, NULL)
-  `).bind(id, item.memory, id, digest).run();
+    ) VALUES (?, 'user-1', NULL, NULL, NULL, ?, '{}', ?, ?, 1, 1, ?)
+  `).bind(id, item.memory, id, digest, deletedAt).run();
 }
 
 function queueMessage(body: MemoryJob, attempts = 1): Message<MemoryJob> {
@@ -283,6 +287,26 @@ describe('durable Mem0 import processing', () => {
     await expect(cleanupMarker()).resolves.toEqual({ cleanup_vector_id: null });
     await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 2, lease_token: 2 });
     await expect(publicationCounts()).resolves.toEqual([1, 0]);
+  });
+
+  it('retries a queue delivery when an insert conflict has no active exact winner', async () => {
+    await seedRequest('queued', Math.floor(Date.now() / 1000));
+    const digest = await contentHash(item.memory);
+    dependencies.upsertVectors.mockImplementationOnce(async () => {
+      await seedCanonicalMemory('request-1', digest, 2);
+      return { mutationId: 'mutation-1' };
+    });
+    const delivery = queueMessage({ type: 'import-mem0-memory', requestId: 'request-1' });
+
+    await handleMemoryQueue(queueBatch(delivery), env);
+
+    expect(delivery.retry).toHaveBeenCalledWith({ delaySeconds: 15 });
+    expect(delivery.ack).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    await expect(ledger()).resolves.toEqual({ status: 'failed', attempt_count: 1, lease_token: 1 });
+    await expect(cleanupMarker()).resolves.toEqual({ cleanup_vector_id: 'request-1' });
+    await expect(env.DB.prepare('SELECT COUNT(*) AS count FROM memory_history').first())
+      .resolves.toEqual({ count: 0 });
   });
 
   it('cannot publish D1 rows after its lease is replaced during Vectorize mutation', async () => {

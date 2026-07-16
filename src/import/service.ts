@@ -15,6 +15,15 @@ export { RawMemoryMigrationExport } from './types';
 
 export type ProcessMem0ImportResult = 'processed' | 'noop' | 'inflight';
 
+export class TransientMem0ImportError extends Error {
+  readonly retryable = true;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'TransientMem0ImportError';
+  }
+}
+
 interface ImportRequestRow {
   request_id: string;
   entity_type: 'user' | 'agent';
@@ -203,7 +212,7 @@ export async function processMem0ImportJob(env: Env, job: Mem0ImportJob): Promis
     );
     if (winner === undefined) {
       await setImportCleanupVectorId(env, claim, claim.request_id);
-      throw new Error('Mem0 import insert conflict has no active exact winner');
+      throw new TransientMem0ImportError('Mem0 import insert conflict has no active exact winner');
     }
 
     await cleanupImportVector(env, claim, claim.request_id);
