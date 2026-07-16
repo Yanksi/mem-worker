@@ -256,6 +256,18 @@ describe('semantic deduplication documentation', () => {
     expect(migrationFiles.filter((path) => /\/0008[^/]*\.sql$/.test(path))).toEqual([]);
   });
 
+  it('does not present pending database uniqueness as included before migration 0008 exists', () => {
+    const hasMigration0008 = migrationFiles.some((path) => /\/0008[^/]*\.sql$/.test(path));
+    const included = readme.slice(readme.indexOf('## Included'), readme.indexOf('## Not Included'));
+    const notIncluded = readme.slice(readme.indexOf('## Not Included'), readme.indexOf('## Configuration'));
+
+    expect(hasMigration0008).toBe(false);
+    if (!hasMigration0008) {
+      expect(included).not.toMatch(/final database-enforced exact uniqueness/i);
+      expect(notIncluded).toContain('Final database-enforced exact uniqueness is pending production verification and the reviewed migration `0008`');
+    }
+  });
+
   it('does not describe the removed manual cleanup control or API', () => {
     expect(readme).not.toContain('Deduplicate memories');
     expect(readme).not.toMatch(/\/dashboard\/api\/[^\s`]*dedup/i);

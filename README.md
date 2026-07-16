@@ -18,7 +18,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). The Deplo
 - Durable tenant-scoped idempotency records, retry-safe deterministic writes, and bounded Queue consumers for asynchronous ingestion and Mem0 imports.
 - Extracted entity and relationship persistence, plus read-only graph endpoints.
 - API-key authentication, per-user memory and graph isolation, and a signed-session operator dashboard with automatic user discovery.
-- Phase-one exact write-time matching, final database-enforced exact uniqueness, optional semantic write-time deduplication, and a Dashboard switch for the semantic mode.
+- Phase-one exact write-time matching, optional semantic write-time deduplication, and a Dashboard switch for the semantic mode.
 - Dashboard views for semantic search, paginated active-memory browsing, a bounded user entity/relationship graph, and dashboard-managed user-ID aliases.
 - D1 migrations, local test coverage, Wrangler configuration, and a deployment guide.
 
@@ -28,6 +28,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). The Deplo
 - Hosted Mem0 Platform features such as organizations, billing, advanced user management, and hosted-dashboard parity.
 - Alternative vector stores, graph databases, or the broad LLM/embedder provider matrix from Mem0 OSS.
 - A Neo4j-style graph engine, unbounded graph traversal, advanced graph analytics, or agent-scoped graphs; graph support is bounded D1-backed storage and reads for user-scoped memories.
+- Final database-enforced exact uniqueness is pending production verification and the reviewed migration `0008`, which is intentionally absent from this branch.
 - Zero-touch Cloudflare setup without operator verification. The guided flow can provision supported resources, but operators must verify bindings and manually apply migrations, create metadata indexes, and set secrets.
 - A general-purpose job-status API or dashboard job monitor beyond the durable ingestion behavior used internally by async memory requests.
 - Dashboard memory editing, general deletion, bulk exports, graph editing, or graph traversal beyond the bounded read-only graph view; the dashboard can create, change, or remove display aliases for stored user IDs.
