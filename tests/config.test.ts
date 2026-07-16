@@ -258,8 +258,16 @@ describe('semantic deduplication documentation', () => {
 
   it('does not present pending database uniqueness as included before migration 0008 exists', () => {
     const hasMigration0008 = migrationFiles.some((path) => /\/0008[^/]*\.sql$/.test(path));
-    const included = readme.slice(readme.indexOf('## Included'), readme.indexOf('## Not Included'));
-    const notIncluded = readme.slice(readme.indexOf('## Not Included'), readme.indexOf('## Configuration'));
+    const includedStart = readme.indexOf('## Included');
+    const notIncludedStart = readme.indexOf('## Not Included');
+    const notIncludedEnd = readme.indexOf('## Architecture');
+
+    expect(includedStart).toBeGreaterThanOrEqual(0);
+    expect(notIncludedStart).toBeGreaterThan(includedStart);
+    expect(notIncludedEnd).toBeGreaterThan(notIncludedStart);
+
+    const included = readme.slice(includedStart, notIncludedStart);
+    const notIncluded = readme.slice(notIncludedStart, notIncludedEnd);
 
     expect(hasMigration0008).toBe(false);
     if (!hasMigration0008) {
