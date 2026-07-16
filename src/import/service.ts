@@ -1,7 +1,7 @@
 import type { Env, Mem0ImportJob, ReclassifyMem0AgentJob } from '../env';
 import { embedText } from '../llm';
 import { findActiveExactMemory, prepareMemoryWrite } from '../memory/deduplication';
-import { memoryVectorMetadata } from '../memory/identity';
+import { contentHash, memoryVectorMetadata, type MemoryOwnerScope } from '../memory/identity';
 import { sha256Hex } from '../memory/idempotency';
 import { deleteVector, upsertVectors } from '../vectorize';
 import {
@@ -24,6 +24,13 @@ export class TransientMem0ImportError extends Error {
   }
 }
 
+export class TerminalMem0ImportConflictError extends Error {
+  constructor(detail: string) {
+    super(`${TERMINAL_IMPORT_CONFLICT_PREFIX} ${detail}`);
+    this.name = 'TerminalMem0ImportConflictError';
+  }
+}
+
 interface ImportRequestRow {
   request_id: string;
   entity_type: 'user' | 'agent';
@@ -33,12 +40,24 @@ interface ImportRequestRow {
   attempt_count: number;
   lease_token: number;
   cleanup_vector_id: string | null;
+  error_message: string | null;
 }
 
+interface ImportMemoryRow {
+  id: string;
+  user_id: string | null;
+  agent_id: string | null;
+  content: string;
+  content_hash: string | null;
+  created_at: number;
+  deleted_at: number | null;
+}
+
+const TERMINAL_IMPORT_CONFLICT_PREFIX = 'Terminal Mem0 import conflict:';
 const IMPORT_PROCESSING_LEASE_SECONDS = 5 * 60;
 const IMPORT_DISPATCH_LEASE_SECONDS = 5 * 60;
 const IMPORT_DISPATCH_BATCH_SIZE = 100;
-const IMPORT_LEDGER_COLUMNS = 'request_id, entity_type, entity_id, item_json, status, attempt_count, lease_token, cleanup_vector_id';
+const IMPORT_LEDGER_COLUMNS = 'request_id, entity_type, entity_id, item_json, status, attempt_count, lease_token, cleanup_vector_id, error_message';
 
 export function isMem0ImportJob(value: unknown): value is Mem0ImportJob {
   if (typeof value !== 'object' || value === null) return false;
@@ -147,19 +166,46 @@ export async function processMem0ImportJob(env: Env, job: Mem0ImportJob): Promis
   const scope = claim.entity_type === 'user'
     ? { userId: claim.entity_id, agentId: null }
     : { userId: null, agentId: claim.entity_id };
+  const expectedContentHash = await contentHash(item.memory);
 
   try {
+    const existingDeterministicRow = await findImportMemoryById(env, claim.request_id);
+    if (existingDeterministicRow !== null) {
+      return await resolveDeterministicImportRow(
+        env,
+        claim,
+        existingDeterministicRow,
+        scope,
+        item,
+        expectedContentHash,
+        metadataJson,
+        now,
+      );
+    }
+
     const cleanedPendingVectorId = await cleanupPendingImportVector(env, claim);
-    const prepared = await prepareMemoryWrite(env, scope, item.memory);
+    const prepared = await prepareImportMemoryWrite(env, scope, item.memory);
     if (prepared.duplicate !== undefined) {
-      if (prepared.duplicate.id === claim.request_id
-        || await findActiveImportMemoryById(env, claim.request_id)) {
-        return completeDeterministicImportLease(env, claim, item, metadataJson, createdAt, now);
+      const concurrentDeterministicRow = await findImportMemoryById(env, claim.request_id);
+      if (concurrentDeterministicRow !== null) {
+        return await resolveDeterministicImportRow(
+          env,
+          claim,
+          concurrentDeterministicRow,
+          scope,
+          item,
+          expectedContentHash,
+          metadataJson,
+          now,
+        );
+      }
+      if (prepared.duplicate.id === claim.request_id) {
+        throw new TransientMem0ImportError('Mem0 import deterministic row disappeared during preparation');
       }
       if (claim.attempt_count > 1 && cleanedPendingVectorId !== claim.request_id) {
         await cleanupImportVector(env, claim, claim.request_id);
       }
-      return completeImportLease(env, claim, now);
+      return await completeImportLease(env, claim, now);
     }
 
     const row = {
@@ -170,8 +216,25 @@ export async function processMem0ImportJob(env: Env, job: Mem0ImportJob): Promis
       metadataJson,
     };
     const embedding = prepared.embedding ?? await embedText(env, item.memory);
-    if (!await hasActiveImportLease(env, claim)) return 'inflight';
+    const preUpsertDeterministicRow = await findImportMemoryById(env, claim.request_id);
+    if (preUpsertDeterministicRow !== null) {
+      return await resolveDeterministicImportRow(
+        env,
+        claim,
+        preUpsertDeterministicRow,
+        scope,
+        item,
+        expectedContentHash,
+        metadataJson,
+        now,
+      );
+    }
+    await setImportCleanupVectorId(env, claim, claim.request_id);
     await upsertVectors(env.VECTORIZE, [{ id: claim.request_id, values: embedding, metadata: await memoryVectorMetadata(row) }]);
+    if (!await hasActiveImportVectorIntent(env, claim)) {
+      await reconcileLostImportVector(env, claim);
+      return 'inflight';
+    }
 
     const inserted = await env.DB.prepare(`
       INSERT INTO memories (
@@ -196,12 +259,27 @@ export async function processMem0ImportJob(env: Env, job: Mem0ImportJob): Promis
       claim.lease_token,
     ).run();
     if (Number(inserted.meta.changes ?? 0) === 1) {
-      return completeDeterministicImportLease(env, claim, item, metadataJson, createdAt, now);
+      await setImportCleanupVectorId(env, claim, null);
+      return await completeDeterministicImportLease(env, claim, item, metadataJson, createdAt, now);
     }
-    if (!await hasActiveImportLease(env, claim)) return 'inflight';
+    if (!await hasActiveImportVectorIntent(env, claim)) {
+      await reconcileLostImportVector(env, claim);
+      return 'inflight';
+    }
 
-    const own = await findActiveImportMemoryById(env, claim.request_id);
-    if (own) return completeDeterministicImportLease(env, claim, item, metadataJson, createdAt, now);
+    const own = await findImportMemoryById(env, claim.request_id);
+    if (own !== null) {
+      return await resolveDeterministicImportRow(
+        env,
+        claim,
+        own,
+        scope,
+        item,
+        expectedContentHash,
+        metadataJson,
+        now,
+      );
+    }
 
     const winner = await findActiveExactMemory(
       env,
@@ -211,12 +289,11 @@ export async function processMem0ImportJob(env: Env, job: Mem0ImportJob): Promis
       claim.request_id,
     );
     if (winner === undefined) {
-      await setImportCleanupVectorId(env, claim, claim.request_id);
       throw new TransientMem0ImportError('Mem0 import insert conflict has no active exact winner');
     }
 
     await cleanupImportVector(env, claim, claim.request_id);
-    return completeImportLease(env, claim, now);
+    return await completeImportLease(env, claim, now);
   } catch (error) {
     await failImportRequest(env, claim.request_id, claim.lease_token, error);
     throw error;
@@ -250,20 +327,138 @@ async function setImportCleanupVectorId(
   }
 }
 
-async function hasActiveImportLease(env: Env, claim: ImportRequestRow): Promise<boolean> {
+async function hasActiveImportVectorIntent(env: Env, claim: ImportRequestRow): Promise<boolean> {
   const active = await env.DB.prepare(`
     SELECT request_id
     FROM mem0_import_requests
     WHERE request_id = ? AND status = 'processing' AND lease_token = ?
-  `).bind(claim.request_id, claim.lease_token).first<{ request_id: string }>();
+      AND cleanup_vector_id = ?
+  `).bind(claim.request_id, claim.lease_token, claim.request_id).first<{ request_id: string }>();
   return active !== null;
 }
 
-async function findActiveImportMemoryById(env: Env, id: string): Promise<boolean> {
-  const row = await env.DB.prepare(`
-    SELECT id FROM memories WHERE id = ? AND deleted_at IS NULL
-  `).bind(id).first<{ id: string }>();
-  return row !== null;
+async function findImportMemoryById(env: Env, id: string): Promise<ImportMemoryRow | null> {
+  return env.DB.prepare(`
+    SELECT id, user_id, agent_id, content, content_hash, created_at, deleted_at
+    FROM memories
+    WHERE id = ?
+  `).bind(id).first<ImportMemoryRow>();
+}
+
+async function resolveDeterministicImportRow(
+  env: Env,
+  claim: ImportRequestRow,
+  row: ImportMemoryRow,
+  scope: MemoryOwnerScope,
+  item: RawMemoryMigrationItem,
+  expectedContentHash: string,
+  metadataJson: string,
+  now: number,
+): Promise<ProcessMem0ImportResult> {
+  if (row.deleted_at !== null) {
+    await cleanupImportVector(env, claim, claim.request_id);
+    throw new TerminalMem0ImportConflictError('deterministic memory ID is occupied by a soft-deleted row');
+  }
+
+  const conflict = deterministicImportRowConflict(row, scope, item.memory, expectedContentHash);
+  await setImportCleanupVectorId(env, claim, null);
+  if (conflict !== undefined) throw new TerminalMem0ImportConflictError(conflict);
+
+  return completeDeterministicImportLease(
+    env,
+    claim,
+    item,
+    metadataJson,
+    row.created_at,
+    now,
+  );
+}
+
+function deterministicImportRowConflict(
+  row: ImportMemoryRow,
+  scope: MemoryOwnerScope,
+  content: string,
+  expectedContentHash: string,
+): string | undefined {
+  if (row.user_id !== scope.userId || row.agent_id !== scope.agentId) {
+    return 'deterministic memory ID is occupied by a row with different ownership';
+  }
+  if (row.content !== content) {
+    return 'deterministic memory ID is occupied by a row with different content';
+  }
+  if (row.content_hash !== expectedContentHash) {
+    return 'deterministic memory ID is occupied by a row with a different content hash';
+  }
+  return undefined;
+}
+
+async function prepareImportMemoryWrite(
+  env: Env,
+  scope: MemoryOwnerScope,
+  content: string,
+) {
+  try {
+    return await prepareMemoryWrite(env, scope, content);
+  } catch (error) {
+    throw new TransientMem0ImportError(
+      `Mem0 import preparation failed: ${safeImportErrorDetail(env, error)}`,
+      { cause: error },
+    );
+  }
+}
+
+async function reconcileLostImportVector(env: Env, claim: ImportRequestRow): Promise<void> {
+  const occupied = await findImportMemoryById(env, claim.request_id);
+  if (occupied?.deleted_at === null) return;
+
+  const current = await findImportRequest(env, claim.request_id);
+  if (current?.status === 'processing') return;
+
+  try {
+    await deleteVector(env.VECTORIZE, claim.request_id);
+  } catch (error) {
+    if (current !== null) await preserveLostImportCleanup(env, current, claim.request_id, error);
+    throw new TransientMem0ImportError(
+      `Mem0 import stale vector cleanup failed: ${safeImportErrorDetail(env, error)}`,
+      { cause: error },
+    );
+  }
+}
+
+async function preserveLostImportCleanup(
+  env: Env,
+  current: ImportRequestRow,
+  vectorId: string,
+  error: unknown,
+): Promise<void> {
+  await env.DB.prepare(`
+    UPDATE mem0_import_requests
+    SET status = 'failed', cleanup_vector_id = ?, error_message = ?,
+        updated_at = unixepoch(), completed_at = NULL
+    WHERE request_id = ? AND status = ? AND lease_token = ?
+  `).bind(
+    vectorId,
+    `Mem0 import stale vector cleanup failed: ${safeImportErrorDetail(env, error)}`,
+    current.request_id,
+    current.status,
+    current.lease_token,
+  ).run();
+}
+
+function safeImportErrorDetail(env: Env, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  let detail = (message.trim() || 'Unknown preparation failure')
+    .replace(/(authorization\s*:\s*bearer)\s+[^\s;,]+/gi, '$1 [REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9_-]+\b/g, '[REDACTED]');
+  const configuredSecrets = [
+    env.DEDUP_LLM_API_KEY,
+    env.LLM_API_KEY,
+    env.EMBEDDING_API_KEY,
+    env.GRAPH_LLM_API_KEY,
+    env.MEM0_API_KEY,
+  ].filter((value): value is string => typeof value === 'string' && value.length >= 4);
+  for (const secret of configuredSecrets) detail = detail.split(secret).join('[REDACTED]');
+  return detail;
 }
 
 async function completeDeterministicImportLease(
@@ -357,16 +552,19 @@ async function claimImportRequest(env: Env, requestId: string): Promise<ImportRe
     SET status = 'processing', attempt_count = attempt_count + 1,
         lease_token = lease_token + 1, error_message = NULL, updated_at = unixepoch(), completed_at = NULL
     WHERE request_id = ? AND (
-      status IN ('queued', 'failed') OR (status = 'processing' AND updated_at < ?)
+      status = 'queued'
+      OR (status = 'failed' AND (error_message IS NULL OR error_message NOT LIKE ?))
+      OR (status = 'processing' AND updated_at < ?)
     )
     RETURNING ${IMPORT_LEDGER_COLUMNS}
-  `).bind(requestId, staleBefore).first<ImportRequestRow>();
+  `).bind(requestId, `${TERMINAL_IMPORT_CONFLICT_PREFIX}%`, staleBefore).first<ImportRequestRow>();
   return claimed ?? undefined;
 }
 
 async function importRequestDisposition(env: Env, requestId: string): Promise<ProcessMem0ImportResult> {
   const current = await findImportRequest(env, requestId);
   if (current?.status === 'completed') return 'noop';
+  if (current?.status === 'failed' && current.error_message?.startsWith(TERMINAL_IMPORT_CONFLICT_PREFIX)) return 'noop';
   if (current?.status === 'queued' || current?.status === 'processing' || current?.status === 'failed') return 'inflight';
   throw new Error('Mem0 import request not found');
 }

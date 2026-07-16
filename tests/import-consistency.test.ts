@@ -109,6 +109,19 @@ async function cleanupMarker() {
   `).first<{ cleanup_vector_id: string | null }>();
 }
 
+async function ledgerFailure() {
+  return env.DB.prepare(`
+    SELECT status, attempt_count, lease_token, error_message, cleanup_vector_id
+    FROM mem0_import_requests WHERE request_id = 'request-1'
+  `).first<{
+    status: string;
+    attempt_count: number;
+    lease_token: number;
+    error_message: string | null;
+    cleanup_vector_id: string | null;
+  }>();
+}
+
 async function publicationCounts() {
   const [memory, history] = await env.DB.batch<{ count: number }>([
     env.DB.prepare('SELECT COUNT(*) AS count FROM memories'),
@@ -211,7 +224,7 @@ describe('durable Mem0 import processing', () => {
 
   it('idempotently finishes history and completion when its deterministic row already exists', async () => {
     await seedRequest('failed', Math.floor(Date.now() / 1000), 1, 1);
-    await seedCanonicalMemory('request-1');
+    await seedCanonicalMemory('request-1', await contentHash(item.memory));
 
     await expect(processMem0ImportJob(env, {
       type: 'import-mem0-memory', requestId: 'request-1',
@@ -227,7 +240,7 @@ describe('durable Mem0 import processing', () => {
   it('preserves its deterministic row when preparation selects an older exact canonical', async () => {
     await seedRequest('failed', Math.floor(Date.now() / 1000), 1, 1);
     await seedCanonicalMemory('canonical-memory');
-    await seedCanonicalMemory('request-1');
+    await seedCanonicalMemory('request-1', await contentHash(item.memory));
 
     await expect(processMem0ImportJob(env, {
       type: 'import-mem0-memory', requestId: 'request-1',
@@ -240,6 +253,131 @@ describe('durable Mem0 import processing', () => {
       SELECT COUNT(*) AS count FROM memory_history WHERE memory_id = 'request-1'
     `).first()).resolves.toEqual({ count: 1 });
     await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 2, lease_token: 2 });
+  });
+
+  it('terminally fails without vector or history mutation when its active ID has edited content', async () => {
+    await seedRequest('failed', Math.floor(Date.now() / 1000), 1, 1);
+    const editedContent = 'This deterministic row was edited after the partial import.';
+    await seedCanonicalMemory('request-1', await contentHash(editedContent));
+    await env.DB.prepare(`
+      UPDATE memories SET content = ? WHERE id = 'request-1'
+    `).bind(editedContent).run();
+    await env.DB.prepare(`
+      UPDATE mem0_import_requests SET cleanup_vector_id = 'request-1' WHERE request_id = 'request-1'
+    `).run();
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).rejects.toThrow(/terminal mem0 import conflict.*content/i);
+
+    expect(dependencies.embedText).not.toHaveBeenCalled();
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    await expect(publicationCounts()).resolves.toEqual([1, 0]);
+    await expect(env.DB.prepare(`
+      SELECT content FROM memories WHERE id = 'request-1'
+    `).first()).resolves.toEqual({ content: editedContent });
+    await expect(ledgerFailure()).resolves.toEqual(expect.objectContaining({
+      status: 'failed',
+      attempt_count: 2,
+      lease_token: 2,
+      error_message: expect.stringMatching(/terminal mem0 import conflict.*content/i),
+      cleanup_vector_id: null,
+    }));
+  });
+
+  it('terminally fails without vector or history mutation when its active ID changed scope', async () => {
+    await seedRequest('failed', Math.floor(Date.now() / 1000), 1, 1);
+    await seedCanonicalMemory('request-1', await contentHash(item.memory));
+    await env.DB.prepare(`
+      UPDATE memories SET user_id = NULL, agent_id = 'other-agent' WHERE id = 'request-1'
+    `).run();
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).rejects.toThrow(/terminal mem0 import conflict.*ownership/i);
+
+    expect(dependencies.embedText).not.toHaveBeenCalled();
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    await expect(publicationCounts()).resolves.toEqual([1, 0]);
+    await expect(env.DB.prepare(`
+      SELECT user_id, agent_id FROM memories WHERE id = 'request-1'
+    `).first()).resolves.toEqual({ user_id: null, agent_id: 'other-agent' });
+  });
+
+  it('revalidates its deterministic ID after preparation before mutating Vectorize', async () => {
+    await seedRequest('queued', Math.floor(Date.now() / 1000));
+    const editedContent = 'A concurrent writer occupied the deterministic import ID.';
+    dependencies.embedText.mockImplementationOnce(async () => {
+      await seedCanonicalMemory('request-1', await contentHash(editedContent));
+      await env.DB.prepare(`
+        UPDATE memories SET content = ? WHERE id = 'request-1'
+      `).bind(editedContent).run();
+      return [0.1, 0.2];
+    });
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).rejects.toThrow(/terminal mem0 import conflict.*content/i);
+
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    await expect(publicationCounts()).resolves.toEqual([1, 0]);
+    await expect(ledgerFailure()).resolves.toEqual(expect.objectContaining({
+      status: 'failed',
+      cleanup_vector_id: null,
+    }));
+  });
+
+  it('cleans a soft-deleted deterministic candidate once and acknowledges repeated deliveries terminally', async () => {
+    await seedRequest('queued', Math.floor(Date.now() / 1000));
+    await seedCanonicalMemory('request-1', await contentHash(item.memory), 2);
+    const firstDelivery = queueMessage({ type: 'import-mem0-memory', requestId: 'request-1' });
+
+    await handleMemoryQueue(queueBatch(firstDelivery), env);
+
+    expect(firstDelivery.ack).toHaveBeenCalledOnce();
+    expect(firstDelivery.retry).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).toHaveBeenCalledOnce();
+    expect(dependencies.deleteVector).toHaveBeenCalledWith(expect.anything(), 'request-1');
+    expect(dependencies.embedText).not.toHaveBeenCalled();
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    await expect(ledgerFailure()).resolves.toEqual(expect.objectContaining({
+      status: 'failed',
+      attempt_count: 1,
+      lease_token: 1,
+      error_message: expect.stringMatching(/terminal mem0 import conflict.*soft-deleted/i),
+      cleanup_vector_id: null,
+    }));
+
+    const repeatedDelivery = queueMessage({ type: 'import-mem0-memory', requestId: 'request-1' }, 2);
+    await handleMemoryQueue(queueBatch(repeatedDelivery), env);
+
+    expect(repeatedDelivery.ack).toHaveBeenCalledOnce();
+    expect(repeatedDelivery.retry).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).toHaveBeenCalledOnce();
+    await expect(ledger()).resolves.toEqual({ status: 'failed', attempt_count: 1, lease_token: 1 });
+    await expect(publicationCounts()).resolves.toEqual([1, 0]);
+  });
+
+  it('uses the persisted deterministic row timestamp when repairing history after time advances', async () => {
+    await seedRequest('failed', Math.floor(Date.now() / 1000), 1, 1);
+    await env.DB.prepare(`
+      UPDATE mem0_import_requests SET item_json = ? WHERE request_id = 'request-1'
+    `).bind(JSON.stringify({ memory: item.memory })).run();
+    await seedCanonicalMemory('request-1', await contentHash(item.memory));
+    await env.DB.prepare(`
+      UPDATE memories SET created_at = 123 WHERE id = 'request-1'
+    `).run();
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+
+    await expect(env.DB.prepare(`
+      SELECT created_at FROM memory_history WHERE memory_id = 'request-1'
+    `).first()).resolves.toEqual({ created_at: 123 });
   });
 
   it('cleans an unmarked retry vector before completing against another canonical row', async () => {
@@ -293,7 +431,11 @@ describe('durable Mem0 import processing', () => {
     await seedRequest('queued', Math.floor(Date.now() / 1000));
     const digest = await contentHash(item.memory);
     dependencies.upsertVectors.mockImplementationOnce(async () => {
-      await seedCanonicalMemory('request-1', digest, 2);
+      await seedCanonicalMemory('hash-conflict', digest);
+      await env.DB.prepare(`
+        UPDATE memories SET content = 'Different content with the same synthetic digest'
+        WHERE id = 'hash-conflict'
+      `).run();
       return { mutationId: 'mutation-1' };
     });
     const delivery = queueMessage({ type: 'import-mem0-memory', requestId: 'request-1' });
@@ -307,6 +449,53 @@ describe('durable Mem0 import processing', () => {
     await expect(cleanupMarker()).resolves.toEqual({ cleanup_vector_id: 'request-1' });
     await expect(env.DB.prepare('SELECT COUNT(*) AS count FROM memory_history').first())
       .resolves.toEqual({ count: 0 });
+  });
+
+  it('reconciles a delayed stale upsert after a replacement completes against another canonical', async () => {
+    await seedRequest('queued', Math.floor(Date.now() / 1000));
+    let releaseOldUpsert!: () => void;
+    const oldUpsertReleased = new Promise<void>((resolve) => {
+      releaseOldUpsert = resolve;
+    });
+    const events: string[] = [];
+    dependencies.upsertVectors.mockImplementationOnce(async () => {
+      events.push('old-upsert-started');
+      await oldUpsertReleased;
+      events.push('old-upsert-finished');
+      return { mutationId: 'old-mutation' };
+    });
+    dependencies.deleteVector.mockImplementation(async () => {
+      events.push('candidate-deleted');
+    });
+
+    const oldWorker = processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    });
+    await vi.waitFor(() => expect(events).toContain('old-upsert-started'));
+
+    await seedCanonicalMemory('replacement-canonical', await contentHash(item.memory));
+    await env.DB.prepare(`
+      UPDATE mem0_import_requests SET updated_at = 0 WHERE request_id = 'request-1'
+    `).run();
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+    events.push('replacement-completed');
+
+    releaseOldUpsert();
+    await expect(oldWorker).resolves.toBe('inflight');
+
+    expect(events).toEqual([
+      'old-upsert-started',
+      'candidate-deleted',
+      'replacement-completed',
+      'old-upsert-finished',
+      'candidate-deleted',
+    ]);
+    expect(dependencies.deleteVector).toHaveBeenCalledTimes(2);
+    await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 2, lease_token: 2 });
+    await expect(cleanupMarker()).resolves.toEqual({ cleanup_vector_id: null });
+    await expect(publicationCounts()).resolves.toEqual([1, 0]);
   });
 
   it('cannot publish D1 rows after its lease is replaced during Vectorize mutation', async () => {

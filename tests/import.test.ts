@@ -481,7 +481,7 @@ describe('Mem0 migration imports', () => {
     })).resolves.toBe('inflight');
 
     const publicationSql = db.statements.map(({ sql }) => sql).join('\n');
-    expect(publicationSql.match(/status = 'processing' AND lease_token = \?/gi)).toHaveLength(4);
+    expect(publicationSql.match(/status = 'processing' AND lease_token = \?/gi)).toHaveLength(6);
   });
 
   it('rejects a legacy queue body that conflicts with its canonical ledger row', async () => {
@@ -751,6 +751,50 @@ describe('Mem0 migration imports', () => {
     expect(dependencies.upsertVectors).toHaveBeenCalledWith(env.VECTORIZE, [expect.objectContaining({
       metadata: expect.objectContaining({ agent_id: 'hermes' }),
     })]);
+  });
+
+  it.each([
+    {
+      label: 'missing semantic deduplication configuration',
+      error: new Error('Missing semantic deduplication configuration: DEDUP_LLM_API_BASE_URL'),
+      detail: 'Missing semantic deduplication configuration: DEDUP_LLM_API_BASE_URL',
+    },
+    {
+      label: 'invalid semantic model output',
+      error: new Error('Invalid semantic duplicate selection: expected a candidate reference'),
+      detail: 'Invalid semantic duplicate selection: expected a candidate reference',
+    },
+    {
+      label: 'semantic provider HTTP failure',
+      error: Object.assign(
+        new Error('Provider HTTP 400: invalid structured response; key=dedup-test-secret'),
+        { status: 400 },
+      ),
+      detail: 'Provider HTTP 400: invalid structured response',
+    },
+  ])('retries import preparation after $label without exposing credentials', async ({ error, detail }) => {
+    const db = durableImportDb();
+    dependencies.prepareMemoryWrite.mockRejectedValue(error);
+    const delivery = {
+      body: { type: 'import-mem0-memory' as const, requestId: 'stable-memory-id' },
+      attempts: 1,
+      ack: vi.fn(),
+      retry: vi.fn(),
+    };
+
+    await handleMemoryQueue(
+      { messages: [delivery] } as unknown as MessageBatch<Env['MEMORY_JOBS'] extends Queue<infer Job> ? Job : never>,
+      { ...env, DB: db, DEDUP_LLM_API_KEY: 'dedup-test-secret' } as unknown as Env,
+    );
+
+    expect(delivery.retry).toHaveBeenCalledWith({ delaySeconds: 15 });
+    expect(delivery.ack).not.toHaveBeenCalled();
+    expect(dependencies.embedText).not.toHaveBeenCalled();
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    const failure = db.statements.find(({ sql }) => /SET status = 'failed'/i.test(sql));
+    expect(failure?.bindings[0]).toContain(`Mem0 import preparation failed: ${detail}`);
+    expect(failure?.bindings[0]).not.toContain('dedup-test-secret');
   });
 
   it('routes an import queue job through direct import processing and acknowledges it', async () => {
