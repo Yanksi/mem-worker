@@ -59,6 +59,14 @@ interface ImportMemoryRow {
   deleted_at: number | null;
 }
 
+interface ReclassifiedMemoryVectorRow {
+  userId: string | null;
+  agentId: string | null;
+  runId: string | null;
+  actorId: string | null;
+  metadataJson: string;
+}
+
 const TERMINAL_IMPORT_CONFLICT_PREFIX = 'Terminal Mem0 import conflict:';
 const IMPORT_PROCESSING_LEASE_SECONDS = 5 * 60;
 const IMPORT_DISPATCH_LEASE_SECONDS = 5 * 60;
@@ -781,18 +789,59 @@ export async function enqueueMem0AgentReclassification(env: Env, sourceUserId: s
 }
 
 export async function processMem0AgentReclassificationJob(env: Env, job: ReclassifyMem0AgentJob): Promise<void> {
-  const metadata = scalarMetadata(job.metadataJson);
-  const embedding = await embedText(env, job.content);
-  await env.DB.prepare(`
+  const targetScope = { userId: null, agentId: job.agentId };
+  const digest = await contentHash(job.content);
+  const collision = await findActiveExactMemory(env, targetScope, job.content, digest, job.id);
+  if (collision !== undefined) {
+    await mergeReclassifiedMemory(env, job.id, collision.id);
+    await deleteVector(env.VECTORIZE, job.id);
+    return;
+  }
+
+  const updated = await env.DB.prepare(`
     UPDATE memories
-    SET user_id = NULL, agent_id = ?
-    WHERE id = ? AND user_id = ? AND deleted_at IS NULL
-  `).bind(job.agentId, job.id, job.sourceUserId).run();
+    SET user_id = NULL, agent_id = ?, content_hash = COALESCE(content_hash, ?)
+    WHERE id = ? AND content = ? AND deleted_at IS NULL
+      AND (user_id = ? OR (user_id IS NULL AND agent_id = ?))
+    RETURNING user_id AS userId, agent_id AS agentId, run_id AS runId,
+      actor_id AS actorId, metadata_json AS metadataJson
+  `).bind(
+    job.agentId,
+    digest,
+    job.id,
+    job.content,
+    job.sourceUserId,
+    job.agentId,
+  ).first<ReclassifiedMemoryVectorRow>();
+  if (updated === null) return;
+
+  const embedding = await embedText(env, job.content);
   await upsertVectors(env.VECTORIZE, [{
     id: job.id,
     values: embedding,
-    metadata: { ...metadata, agent_id: job.agentId },
+    metadata: await memoryVectorMetadata(updated),
   }]);
+}
+
+async function mergeReclassifiedMemory(env: Env, sourceId: string, canonicalTargetId: string): Promise<void> {
+  await env.DB.batch([
+    env.DB.prepare(`
+      INSERT OR IGNORE INTO memory_entity_links (memory_id, entity_id, created_at)
+      SELECT ?, entity_id, created_at
+      FROM memory_entity_links
+      WHERE memory_id = ?
+    `).bind(canonicalTargetId, sourceId),
+    env.DB.prepare(`
+      UPDATE relationships
+      SET evidence_memory_id = ?
+      WHERE evidence_memory_id = ?
+    `).bind(canonicalTargetId, sourceId),
+    env.DB.prepare(`
+      UPDATE memories
+      SET deleted_at = unixepoch()
+      WHERE id = ? AND deleted_at IS NULL
+    `).bind(sourceId),
+  ]);
 }
 
 function importScope(job: Mem0ImportJob): DashboardEntityScope {
@@ -843,18 +892,6 @@ function validSourceTimestamp(value: string | null | undefined): number | undefi
   if (typeof value !== 'string') return undefined;
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp) ? timestamp : undefined;
-}
-
-function scalarMetadata(value: string): Record<string, VectorizeVectorMetadataValue> {
-  try {
-    const parsed: unknown = JSON.parse(value);
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {};
-    return Object.fromEntries(Object.entries(parsed).filter(([, item]) => (
-      typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean'
-    ))) as Record<string, VectorizeVectorMetadataValue>;
-  } catch {
-    return {};
-  }
 }
 
 function sourceUnixTimestamp(value: string | null): number | undefined {

@@ -1,5 +1,6 @@
 import type { Env } from '../env';
 import { embedText } from '../llm';
+import { memoryVectorMetadata } from '../memory/identity';
 import type { MemoryResponse } from '../memory/types';
 import { upsertVectors } from '../vectorize';
 
@@ -190,17 +191,18 @@ export async function reindexDashboardMemory(
 ): Promise<boolean> {
   const column = dashboardScopeColumn(entityType);
   const row = await env.DB.prepare(`
-    SELECT id, user_id, agent_id, run_id, actor_id, content, metadata_json, created_at, updated_at
+    SELECT id, user_id AS userId, agent_id AS agentId, run_id AS runId,
+      actor_id AS actorId, content, metadata_json AS metadataJson
     FROM memories
     WHERE id = ? AND ${column} = ? AND deleted_at IS NULL
-  `).bind(memoryId, entityId).first<MemoryRow>();
+  `).bind(memoryId, entityId).first<DashboardVectorRow>();
   if (row === null) return false;
 
   const vector = await embedText(env, row.content);
   await upsertVectors(env.VECTORIZE, [{
     id: row.id,
     values: vector,
-    metadata: vectorMetadata(row),
+    metadata: await memoryVectorMetadata(row),
   }]);
   return true;
 }
@@ -219,6 +221,16 @@ interface MemoryRow {
   metadata_json: string;
   created_at: number;
   updated_at: number;
+}
+
+interface DashboardVectorRow {
+  id: string;
+  userId: string | null;
+  agentId: string | null;
+  runId: string | null;
+  actorId: string | null;
+  content: string;
+  metadataJson: string;
 }
 
 function toMemoryResponse(row: MemoryRow): MemoryResponse {
@@ -244,18 +256,4 @@ function parseMetadata(value: string): Record<string, unknown> {
   } catch {
     return {};
   }
-}
-
-function vectorMetadata(row: MemoryRow): Record<string, VectorizeVectorMetadataValue> {
-  const metadata = parseMetadata(row.metadata_json);
-  const scalarMetadata = Object.fromEntries(Object.entries(metadata).filter(([, value]) => (
-    value === null || typeof value === 'string' || typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))
-  ))) as Record<string, VectorizeVectorMetadataValue>;
-  return {
-    ...scalarMetadata,
-    ...(row.user_id === null ? {} : { user_id: row.user_id }),
-    ...(row.agent_id === null ? {} : { agent_id: row.agent_id }),
-    ...(row.run_id === null ? {} : { run_id: row.run_id }),
-    ...(row.actor_id === null ? {} : { actor_id: row.actor_id }),
-  };
 }

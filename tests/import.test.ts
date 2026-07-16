@@ -24,9 +24,11 @@ import worker from '../src/index';
 import {
   dispatchPendingMem0Imports,
   enqueueMem0Import,
+  processMem0AgentReclassificationJob,
   processMem0ImportJob,
   RawMemoryMigrationExport,
 } from '../src/import/service';
+import { contentHash, scopeKey } from '../src/memory/identity';
 
 const env = {
   MEMORY_JOBS: { send: vi.fn(), sendBatch: vi.fn() },
@@ -165,6 +167,35 @@ function durableImportDb(canonical: ImportRequestFixture = {
     }));
   });
   return { prepare, batch, statements, events };
+}
+
+function reclassificationDb(updatedRow?: {
+  userId: string | null;
+  agentId: string | null;
+  runId: string | null;
+  actorId: string | null;
+  metadataJson: string;
+}) {
+  const statements: Array<{ sql: string; bindings: unknown[] }> = [];
+  const prepare = vi.fn((sql: string) => {
+    const call = { sql, bindings: [] as unknown[] };
+    statements.push(call);
+    const statement = {
+      bind: vi.fn((...bindings: unknown[]) => {
+        call.bindings = bindings;
+        return statement;
+      }),
+      first: vi.fn(async () => (/UPDATE memories/i.test(sql) && /RETURNING/i.test(sql) ? updatedRow ?? null : null)),
+      run: vi.fn(async () => ({ success: true, results: [], meta: { changes: 1 } })),
+    };
+    return statement;
+  });
+  const batch = vi.fn(async (items: unknown[]) => items.map(() => ({
+    success: true,
+    results: [],
+    meta: { changes: 1 },
+  })));
+  return { prepare, batch, statements };
 }
 
 describe('Mem0 migration imports', () => {
@@ -865,5 +896,110 @@ describe('Mem0 migration imports', () => {
     expect(dependencies.embedText).toHaveBeenCalledWith(expect.objectContaining({ DB: db }), exportedMemory.memory);
     expect(message.ack).toHaveBeenCalledOnce();
     expect(message.retry).not.toHaveBeenCalled();
+  });
+});
+
+describe('Mem0 agent reclassification', () => {
+  const job = {
+    type: 'reclassify-mem0-agent' as const,
+    id: 'source-memory',
+    sourceUserId: 'legacy-agent-user',
+    agentId: 'agent-1',
+    content: '  Exact raw memory.  ',
+    metadataJson: JSON.stringify({ source: 'mem0', ignoredNull: null, agent_id: 'spoofed' }),
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dependencies.findActiveExactMemory.mockResolvedValue(undefined);
+    dependencies.embedText.mockResolvedValue([0.4, 0.6]);
+    dependencies.upsertVectors.mockResolvedValue(undefined);
+    dependencies.deleteVector.mockResolvedValue(undefined);
+  });
+
+  it('backfills a null content hash and reindexes the moved row in its agent-only scope', async () => {
+    const db = reclassificationDb({
+      userId: null,
+      agentId: 'agent-1',
+      runId: 'run-1',
+      actorId: 'actor-1',
+      metadataJson: job.metadataJson,
+    });
+    const digest = await contentHash(job.content);
+
+    await processMem0AgentReclassificationJob({ ...env, DB: db } as unknown as Env, job);
+
+    expect(dependencies.findActiveExactMemory).toHaveBeenCalledWith(
+      expect.objectContaining({ DB: db }),
+      { userId: null, agentId: 'agent-1' },
+      job.content,
+      digest,
+      job.id,
+    );
+    const update = db.statements.find(({ sql }) => /UPDATE memories/i.test(sql));
+    expect(update?.sql).toMatch(/content_hash\s*=\s*COALESCE\(content_hash, \?\)/i);
+    expect(update?.bindings).toEqual(expect.arrayContaining([
+      'agent-1', digest, 'source-memory', 'legacy-agent-user',
+    ]));
+    expect(dependencies.embedText).toHaveBeenCalledWith(expect.objectContaining({ DB: db }), job.content);
+    expect(dependencies.upsertVectors).toHaveBeenCalledWith(env.VECTORIZE, [{
+      id: 'source-memory',
+      values: [0.4, 0.6],
+      metadata: {
+        source: 'mem0',
+        agent_id: 'agent-1',
+        run_id: 'run-1',
+        actor_id: 'actor-1',
+        scope_key: await scopeKey({ userId: null, agentId: 'agent-1' }),
+      },
+    }]);
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+  });
+
+  it('keeps the older exact target canonical and atomically rewires the source graph before deleting its vector', async () => {
+    const db = reclassificationDb();
+    const canonicalTarget = {
+      id: 'older-target',
+      userId: null,
+      agentId: 'agent-1',
+      runId: null,
+      actorId: null,
+      content: job.content,
+      metadataJson: '{"canonical":true}',
+      hash: 'target-hash',
+      contentHash: null,
+      createdAt: 1,
+      updatedAt: 1,
+      deletedAt: null,
+    };
+    dependencies.findActiveExactMemory.mockResolvedValue(canonicalTarget);
+    const digest = await contentHash(job.content);
+
+    await processMem0AgentReclassificationJob({ ...env, DB: db } as unknown as Env, job);
+    await processMem0AgentReclassificationJob({ ...env, DB: db } as unknown as Env, job);
+
+    expect(dependencies.findActiveExactMemory).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ DB: db }),
+      { userId: null, agentId: 'agent-1' },
+      job.content,
+      digest,
+      job.id,
+    );
+    expect(db.batch).toHaveBeenCalledTimes(2);
+    const [firstBatch] = db.batch.mock.calls[0];
+    expect(firstBatch).toHaveLength(3);
+    const [copyLinks, rewireRelationships, softDeleteSource] = db.statements.slice(0, 3);
+    expect(copyLinks.sql).toMatch(/INSERT OR IGNORE INTO memory_entity_links[\s\S]*SELECT \?, entity_id, created_at[\s\S]*WHERE memory_id = \?/i);
+    expect(copyLinks.bindings).toEqual(['older-target', 'source-memory']);
+    expect(rewireRelationships.sql).toMatch(/UPDATE relationships\s+SET evidence_memory_id = \?\s+WHERE evidence_memory_id = \?/i);
+    expect(rewireRelationships.bindings).toEqual(['older-target', 'source-memory']);
+    expect(softDeleteSource.sql).toMatch(/UPDATE memories\s+SET deleted_at = unixepoch\(\)\s+WHERE id = \? AND deleted_at IS NULL/i);
+    expect(softDeleteSource.bindings).toEqual(['source-memory']);
+    expect(db.statements.some(({ sql, bindings }) => /UPDATE memories/i.test(sql) && bindings.includes('older-target'))).toBe(false);
+    expect(dependencies.deleteVector).toHaveBeenCalledTimes(2);
+    expect(dependencies.deleteVector).toHaveBeenNthCalledWith(1, env.VECTORIZE, 'source-memory');
+    expect(dependencies.embedText).not.toHaveBeenCalled();
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
   });
 });
