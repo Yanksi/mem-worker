@@ -11,14 +11,15 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 ## Included
 
 - A Cloudflare Worker HTTP API for adding, searching, listing, reading, updating, and soft-deleting memories.
-- OpenAI-compatible chat-completion fact extraction and embedding requests, using the configured OpenAI API endpoint and models.
+- OpenAI-compatible chat-completion fact extraction and embedding requests, using the configured provider endpoints and models.
 - Cloudflare Vectorize upserts, deletes, scoped semantic search, and validated metadata filters.
 - Mem0-compatible entity linking that boosts inferred user-memory search results without changing Hermes requests.
 - D1-backed memory metadata, audit history, graph-lite entities, relationships, and memory/entity links.
 - Durable tenant-scoped idempotency records, retry-safe deterministic writes, and bounded Queue consumers for asynchronous ingestion and Mem0 imports.
 - Extracted entity and relationship persistence, plus read-only graph endpoints.
 - API-key authentication, per-user memory and graph isolation, and a signed-session operator dashboard with automatic user discovery.
-- Dashboard views for semantic search, paginated active-memory browsing, exact-text deduplication across discovered user and agent entities, a bounded user entity/relationship graph, and dashboard-managed user-ID aliases.
+- Exact write-time memory deduplication, optional semantic write-time deduplication, and a Dashboard switch for the semantic mode.
+- Dashboard views for semantic search, paginated active-memory browsing, a bounded user entity/relationship graph, and dashboard-managed user-ID aliases.
 - D1 migrations, local test coverage, Wrangler configuration, and a deployment guide.
 
 ## Not Included
@@ -29,7 +30,8 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - A Neo4j-style graph engine, unbounded graph traversal, advanced graph analytics, or agent-scoped graphs; graph support is bounded D1-backed storage and reads for user-scoped memories.
 - Automatic Cloudflare resource provisioning or secret creation. Deployment requires creating the D1 database, Vectorize indexes, Queue and DLQ, metadata indexes, and secrets described below.
 - A general-purpose job-status API or dashboard job monitor beyond the durable ingestion behavior used internally by async memory requests.
-- Dashboard memory editing, general deletion, bulk exports, graph editing, or graph traversal beyond the bounded read-only graph view. Exact-text deduplication is the limited deletion exception; the dashboard can otherwise only create, change, or remove display aliases for stored user IDs.
+- Dashboard memory editing, general deletion, bulk exports, graph editing, or graph traversal beyond the bounded read-only graph view; the dashboard can create, change, or remove display aliases for stored user IDs.
+- Automatic semantic consolidation of existing memories or a general bulk cleanup UI. Semantic meaning deduplication is opt-in and applies only to new writes.
 
 ## Architecture
 
@@ -37,20 +39,46 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - **D1** stores memories, idempotency/request state, history, and graph-lite entities/relationships.
 - **Vectorize** stores memory embeddings plus a parallel entity index used for Mem0-style entity-link score fusion.
 - **Queues** receives asynchronous extraction-and-store jobs. Import work is backed by a canonical D1 ledger, bounded to one message per batch and two concurrent consumers, retried with delay on transient Vectorize failures, and exhausted deliveries are retained in a DLQ.
-- **OpenAI-compatible endpoints** are used for embeddings and chat-completion memory extraction. They default to the OpenAI API, but extraction and embedding base URLs can be configured independently.
+- **OpenAI-compatible endpoints** are used for embeddings, extraction, graph reflection, and semantic deduplication. Each model path has its own endpoint, model, and credential.
 
 All `/v1/*` routes require `Authorization: Bearer $MEM0_API_KEY`. The dashboard has its own password login.
 
 ### Model and endpoint defaults
 
-- **Extraction model:** `gpt-4o-mini` (`LLM_MODEL`)
-- **Embedding model:** `text-embedding-3-small` (`EMBEDDING_MODEL`)
+- **Extraction model:** `openai/gpt-4o-mini` (`LLM_MODEL`)
+- **Embedding model:** `openai/text-embedding-3-small` (`EMBEDDING_MODEL`)
 - **Extraction endpoint:** `https://openrouter.ai/api/v1` by default (`LLM_API_BASE_URL`), authenticated with `LLM_API_KEY`
 - **Embedding endpoint:** `https://openrouter.ai/api/v1` by default (`EMBEDDING_API_BASE_URL`), authenticated with `EMBEDDING_API_KEY`
 
-Graph reflection uses separate Worker variables: `GRAPH_LLM_API_BASE_URL` (default `https://openrouter.ai/api/v1`), `GRAPH_LLM_MODEL` (default `deepseek/deepseek-v4-flash`), and `GRAPH_LLM_THINKING_LEVEL` (default `low`). Set `GRAPH_LLM_API_KEY` as a Cloudflare secret; it is intentionally not a `wrangler.toml` variable. Thinking levels `disabled`, `low`, `medium`, and `high` map to OpenRouter's `reasoning` object: `disabled` sends `{ "enabled": false }`, while the other values send `{ "effort": "low" | "medium" | "high" }`. Graph reflection currently only adapts the OpenRouter endpoint.
+Graph reflection uses separate Worker variables: `GRAPH_LLM_API_BASE_URL` (default `https://openrouter.ai/api/v1`), `GRAPH_LLM_MODEL` (default `deepseek/deepseek-v4-flash`), and `GRAPH_LLM_THINKING_LEVEL` (default `low`). Thinking levels `disabled`, `low`, `medium`, and `high` map to OpenRouter's `reasoning` object: `disabled` sends `{ "enabled": false }`, while the other values send `{ "effort": "low" | "medium" | "high" }`. Graph reflection currently only adapts the OpenRouter endpoint.
 
-Both endpoints and their credentials are configured independently and must implement the OpenAI-compatible `/chat/completions` or `/embeddings` path respectively. Base URLs may include `/v1`; trailing slashes are ignored. `LLM_API_KEY`, `EMBEDDING_API_KEY`, and `GRAPH_LLM_API_KEY` are three separate required secrets for their respective model paths; no model path reads another path's key.
+| Model path | Endpoint variable | Model variable | Required secret |
+| --- | --- | --- | --- |
+| Extraction | `LLM_API_BASE_URL` | `LLM_MODEL` | `LLM_API_KEY` |
+| Embedding | `EMBEDDING_API_BASE_URL` | `EMBEDDING_MODEL` | `EMBEDDING_API_KEY` |
+| Graph reflection | `GRAPH_LLM_API_BASE_URL` | `GRAPH_LLM_MODEL` | `GRAPH_LLM_API_KEY` |
+| Semantic deduplication | `DEDUP_LLM_API_BASE_URL` | `DEDUP_LLM_MODEL` | `DEDUP_LLM_API_KEY` |
+
+These four model paths are configured independently. Every key is a secret, and a model path never falls back to another model path's key. There is no `OPENAI_API_KEY` fallback or shared OpenRouter key. Endpoints and models are plaintext Worker variables. Base URLs may include `/v1`; trailing slashes are ignored. The chat and embedding providers must implement the compatible `/chat/completions` and `/embeddings` paths respectively.
+
+### Memory deduplication
+
+Exact write-time deduplication is always enabled. It uses the full (`user_id`, `agent_id`) scope, including every null/value combination, and compares raw memory text after the hash lookup, guarding against hash collisions. This exact check does not depend on the semantic setting or an LLM.
+
+Semantic write-time deduplication defaults to **off**. Enable it with the switch at `Dashboard > System settings` after configuring its dedicated endpoint, model, and key. Only new writes are checked semantically; existing memories are not semantically consolidated. A duplicate paraphrase discards the new write and leaves the older canonical memory unchanged. Contradictions, temporal or state changes, material additions, subsets, supersets, and uncertain matches remain distinct memories. Simultaneous paraphrased writes are not serialized, so both writes can survive.
+
+Structured-output adaptation for semantic deduplication is currently OpenRouter-only. The Dashboard API and UI expose only the on/off setting; they do not expose the deduplication key, endpoint, or model.
+
+The semantic deduplication endpoint, model, similarity threshold, and candidate limit use these plaintext defaults in both Wrangler configurations:
+
+| Variable | Default |
+| --- | --- |
+| `DEDUP_LLM_API_BASE_URL` | `https://openrouter.ai/api/v1` |
+| `DEDUP_LLM_MODEL` | `openai/gpt-4o-mini` |
+| `DEDUP_SIMILARITY_THRESHOLD` | `0.85` |
+| `DEDUP_CANDIDATE_LIMIT` | `8` |
+
+The endpoint, model, similarity threshold, and candidate limit are plaintext Worker variables. `DEDUP_LLM_API_KEY` remains a secret and is never placed in `wrangler.toml`.
 
 ### Hermes compatibility
 
@@ -166,9 +194,10 @@ The dashboard offers:
 
 - **Search memory** performs semantic recall for the selected user or agent.
 - **All memories** displays the selected entity's active memories, newest first, with pagination and a detail inspector.
-- **Deduplicate memories** is scoped to the selected user or agent and removes only active memories with exactly identical content. It preserves the oldest memory in each duplicate group, requires explicit confirmation, and soft-deletes the redundant memories so their history remains available. Re-running cleanup after an interrupted vector cleanup repairs the remaining vector cleanup without deleting additional memories.
 - **Memory graph** displays a selected user's stored entities and relationships as a bounded interactive graph; it is unavailable for agent entities.
 - **Import from Mem0** queues a `RawMemoryMigrationExport` for a chosen user or agent target.
+
+The **System settings** view contains the semantic memory deduplication switch. Exact write-time deduplication has no switch because it is always active. The old Dashboard cleanup control and endpoint no longer exist.
 
 The adjacent **Edit** control saves a dashboard-managed alias in D1. Once set, the selector displays the alias rather than the raw user ID; aliases do not alter API ownership, Hermes identities, or stored memory data. Apply the latest D1 migration after upgrading to create the alias table.
 
@@ -203,7 +232,7 @@ The accepted export is exactly this JSON Schema:
 
 Submitting posts `{ "entity_type": "user" | "agent", "entity_id": "...", "export": { ... } }` to the signed-session dashboard endpoint `/dashboard/api/imports/mem0`. It returns a queued count and processing continues asynchronously through Cloudflare Queues. Each item is persisted first in the D1 `mem0_import_requests` ledger. The consumer reads the canonical payload from that ledger, waits for Vectorize to accept the upsert, then atomically publishes the memory, history, and completed status in a lease-fenced D1 batch. A scheduled dispatcher recovers rows left unpublished by a producer interruption. Vectorize query visibility can lag briefly after completion, but an upsert failure cannot leave the import permanently present only in D1.
 
-Each source `memory` is stored as exact text with valid source timestamps preserved (missing timestamps use import time). Import processing embeds the text directly, is retry-idempotent, and performs no LLM extraction or graph inference. The Dashboard does not yet show per-import progress or DLQ failures; cross-message Vectorize batching and durable deduplication maintenance are also not part of this first consistency pass.
+Each source `memory` is stored as exact text with valid source timestamps preserved (missing timestamps use import time). Import processing embeds the text directly, is retry-idempotent, and performs no LLM extraction or graph inference. The Dashboard does not yet show per-import progress or DLQ failures; cross-message Vectorize batching is also not part of this consistency pass.
 
 ### Add a memory
 
@@ -245,6 +274,8 @@ Create `.dev.vars` (do not commit it):
 ```dotenv
 LLM_API_KEY=replace-with-the-extraction-provider-key
 EMBEDDING_API_KEY=replace-with-the-embedding-provider-key
+GRAPH_LLM_API_KEY=replace-with-the-graph-provider-key
+DEDUP_LLM_API_KEY=replace-with-the-deduplication-provider-key
 MEM0_API_KEY=replace-with-a-long-random-api-key
 DASHBOARD_PASSWORD=replace-with-a-strong-dashboard-password
 ```
@@ -252,16 +283,20 @@ DASHBOARD_PASSWORD=replace-with-a-strong-dashboard-password
 Models and endpoints are normal Worker variables, not secrets. Set their deployed values in the Cloudflare dashboard under **Workers & Pages > your Worker > Settings > Variables and Secrets**, or change the defaults in `wrangler.toml`:
 
 ```toml
-LLM_MODEL=gpt-4o-mini
-EMBEDDING_MODEL=text-embedding-3-small
+LLM_MODEL=openai/gpt-4o-mini
+EMBEDDING_MODEL=openai/text-embedding-3-small
 LLM_API_BASE_URL=https://openrouter.ai/api/v1
 EMBEDDING_API_BASE_URL=https://openrouter.ai/api/v1
 GRAPH_LLM_API_BASE_URL=https://openrouter.ai/api/v1
 GRAPH_LLM_MODEL=deepseek/deepseek-v4-flash
 GRAPH_LLM_THINKING_LEVEL=low
+DEDUP_LLM_API_BASE_URL=https://openrouter.ai/api/v1
+DEDUP_LLM_MODEL=openai/gpt-4o-mini
+DEDUP_SIMILARITY_THRESHOLD=0.85
+DEDUP_CANDIDATE_LIMIT=8
 ```
 
-`LLM_MODEL` and `EMBEDDING_MODEL` are configurable independently. Ensure the selected embedding model returns **1,536 dimensions or fewer**: Cloudflare Vectorize currently caps vectors at 1,536 float32 dimensions. This Worker rejects larger embedding responses before attempting an upsert. [Cloudflare Vectorize limits](https://developers.cloudflare.com/vectorize/platform/limits/)
+`LLM_MODEL` and `EMBEDDING_MODEL` are configurable independently. Cloudflare Vectorize supports at most 1,536 dimensions. The embedding output, Vectorize index, and `VECTOR_DIMENSIONS` configuration must match exactly; this Worker rejects mismatched or oversized embedding responses before attempting an upsert. Vectorize dimensions are immutable; changing dimensions requires recreating the indexes. [Cloudflare Vectorize limits](https://developers.cloudflare.com/vectorize/platform/limits/)
 
 For Hermes, configure the Worker URL and shared key in the gateway environment:
 
@@ -282,7 +317,7 @@ Use the local URL printed by Wrangler, typically `http://localhost:8787`. Visit 
 
 ### Remote read-only dashboard preview
 
-Run `npm run dev:remote-readonly` to execute local dashboard code with the configured remote D1 and Vectorize resources; queue bindings remain local. The preview reads remote data but the server rejects dashboard alias, deduplication, import, and agent-reclassification mutations with `403`; it does not change the deployed Worker configuration.
+Run `npm run dev:remote-readonly` to execute local dashboard code with the configured remote D1 and Vectorize resources; queue bindings remain local. The preview reads remote data but the server rejects dashboard alias, system-setting, import, and agent-reclassification mutations with `403`; it does not change the deployed Worker configuration.
 
 Open the local URL printed by Wrangler, sign in with `DASHBOARD_PASSWORD`, select `User: curl-403-probe-user-5940ad806c8e4792a38908c026b276e3`, and open **Memory graph** to inspect the retained graph probe data.
 
@@ -316,13 +351,14 @@ npm run typecheck
    npx wrangler queues create mem0-edge-memory-jobs
    ```
 
-4. Before using semantic-search filters, add Vectorize metadata indexes for every identity field the Worker filters on:
+4. Before using semantic-search filters, add Vectorize metadata indexes for every identity field the Worker filters on. Create the string `scope_key` metadata index before maintenance reindex/backfill.
 
    ```sh
    npx wrangler vectorize create-metadata-index mem0-edge --property-name=user_id --type=string
    npx wrangler vectorize create-metadata-index mem0-edge --property-name=agent_id --type=string
    npx wrangler vectorize create-metadata-index mem0-edge --property-name=run_id --type=string
    npx wrangler vectorize create-metadata-index mem0-edge --property-name=actor_id --type=string
+   npx wrangler vectorize create-metadata-index mem0-edge --property-name=scope_key --type=string
    npx wrangler vectorize create-metadata-index mem0-edge-entities --property-name=user_id --type=string
    ```
 
@@ -337,14 +373,48 @@ npm run typecheck
    ```sh
    npx wrangler secret put LLM_API_KEY
    npx wrangler secret put EMBEDDING_API_KEY
+   npx wrangler secret put GRAPH_LLM_API_KEY
+   npx wrangler secret put DEDUP_LLM_API_KEY
    npx wrangler secret put MEM0_API_KEY
    npx wrangler secret put DASHBOARD_PASSWORD
-   npx wrangler secret put GRAPH_LLM_API_KEY
    ```
 
-For an existing deployment, create both `LLM_API_KEY` and `EMBEDDING_API_KEY` before deploying this version. `GRAPH_LLM_API_KEY` remains the separate graph reflection credential. The legacy `OPENAI_API_KEY` is no longer read and can be removed after the deployment succeeds.
+For an existing deployment, create all four independent model credentials before deploying this version. `DEDUP_LLM_API_KEY` is required before the semantic switch can be enabled; exact write-time deduplication does not use it.
 
-`EMBEDDING_MODEL` and `LLM_MODEL` are runtime settings. `VECTOR_DIMENSIONS` and `MEM0_INDEX_NAME` document the deployment convention; the effective Vectorize resource is the `[[vectorize]]` binding, and its dimensions must match the embedding model response.
+`EMBEDDING_MODEL`, `LLM_MODEL`, `GRAPH_LLM_MODEL`, and `DEDUP_LLM_MODEL` are runtime settings. `VECTOR_DIMENSIONS` and `MEM0_INDEX_NAME` document the deployment convention; the effective Vectorize resource is the `[[vectorize]]` binding, and its dimensions must match the embedding model response.
+
+### Existing-deployment deduplication maintenance
+
+Migration `0008` is intentionally not included in the repository yet. Keep the rollout in these production-gated phases:
+
+1. Deploy the application code and apply migration `0007_memory_deduplication_prepare.sql` only.
+2. Run `inspect` and review its report and backup.
+3. Pause writers and drain the queue according to your operator workflow.
+4. Run `apply --confirm`.
+5. Run `verify` and confirm that it succeeds in production.
+6. Only after successful production verification, create and apply migration `0008` to enforce the final exact-deduplication constraints.
+
+Do not resume writers between apply and verification. If `verify` reports asynchronous Vectorize cleanup still settling, keep writers paused and rerun it. Do not create migration `0008` based only on a local or staging result.
+
+The package commands are:
+
+```sh
+npm run maintenance:dedup -- inspect
+npm run maintenance:dedup -- apply --confirm
+npm run maintenance:dedup -- verify
+```
+
+The equivalent direct commands are:
+
+```sh
+node --env-file=.env scripts/migrate-memory-deduplication.mjs inspect
+node --env-file=.env scripts/migrate-memory-deduplication.mjs apply --confirm
+node --env-file=.env scripts/migrate-memory-deduplication.mjs verify
+```
+
+The package script reads `.env` when it exists; the direct form shown above requires it. Set `CLOUDFLARE_API_TOKEN`, `MEM0_BASE_URL`, and `DASHBOARD_PASSWORD`; `CLOUDFLARE_ACCOUNT_ID` is optional when the token can resolve exactly one account. Use a narrowly scoped Cloudflare token, run maintenance from a secured workstation, and keep writers paused according to your incident and deployment procedures.
+
+`inspect` writes a timestamped JSON backup under `backups/` with restrictive permissions where the platform supports them. Inspection backups contain memory contents and must be protected as sensitive data: do not commit or share them, restrict access, and remove them according to your retention policy after verification. Review the inspection mapping before apply; `apply --confirm` backfills hashes, consolidates exact duplicates, removes stale vectors, and reindexes active memories with `scope_key`. `verify` checks hashes, duplicate groups, active/deleted vectors, and `scope_key` metadata.
 
 ## Manual deployment
 
