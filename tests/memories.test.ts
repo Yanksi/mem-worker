@@ -567,6 +567,88 @@ describe('addMemory idempotency ledger', () => {
     })]);
   });
 
+  it.each([
+    ['without an agent', undefined, null],
+    ['with an agent', 'agent-123', 'agent-123'],
+  ] as const)('prepares a normal new candidate with full scope %s', async (_label, agentId, expectedAgentId) => {
+    const { db } = createMemoryWriteDb({
+      memoryInsertResults: [memoryRow('inserted-placeholder', 'Scoped fact')],
+    });
+    dependencies.createDb.mockReturnValue(db);
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: 'scoped-content-digest',
+      exactScopeKey: 'scope-key',
+      embedding: [0.2, 0.4],
+    });
+    dependencies.upsertVectors.mockResolvedValue(undefined);
+    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
+
+    await actual.addMemory(env, {
+      ...addRequest,
+      infer: false,
+      ...(agentId === undefined ? {} : { agent_id: agentId }),
+      messages: [{ role: 'user', content: 'Scoped fact' }],
+    });
+
+    expect(dependencies.prepareMemoryWrite).toHaveBeenCalledOnce();
+    expect(dependencies.prepareMemoryWrite).toHaveBeenCalledWith(
+      env,
+      { userId: 'user-123', agentId: expectedAgentId },
+      'Scoped fact',
+    );
+  });
+
+  it('embeds a normal new candidate exactly once when preparation has no embedding', async () => {
+    const { db } = createMemoryWriteDb({
+      memoryInsertResults: [memoryRow('inserted-placeholder', 'Fallback fact')],
+    });
+    dependencies.createDb.mockReturnValue(db);
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: 'fallback-content-digest',
+      exactScopeKey: 'scope-key',
+    });
+    dependencies.embedText.mockResolvedValue([0.6, 0.8]);
+    dependencies.upsertVectors.mockResolvedValue(undefined);
+    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
+
+    await actual.addMemory(env, {
+      ...addRequest,
+      infer: false,
+      messages: [{ role: 'user', content: 'Fallback fact' }],
+    });
+
+    expect(dependencies.embedText).toHaveBeenCalledOnce();
+    expect(dependencies.embedText).toHaveBeenCalledWith(env, 'Fallback fact');
+    expect(dependencies.upsertVectors).toHaveBeenCalledWith(env.VECTORIZE, [expect.objectContaining({
+      values: [0.6, 0.8],
+    })]);
+  });
+
+  it('upserts the candidate vector before attempting the memory row insert', async () => {
+    const { db } = createMemoryWriteDb({
+      memoryInsertResults: [memoryRow('inserted-placeholder', 'Ordered fact')],
+    });
+    dependencies.createDb.mockReturnValue(db);
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: 'ordered-content-digest',
+      exactScopeKey: 'scope-key',
+      embedding: [0.1, 0.9],
+    });
+    dependencies.upsertVectors.mockResolvedValue(undefined);
+    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
+
+    await actual.addMemory(env, {
+      ...addRequest,
+      infer: false,
+      messages: [{ role: 'user', content: 'Ordered fact' }],
+    });
+
+    const memoryInsertCall = db.insert.mock.calls.findIndex(([table]) => table === memories);
+    expect(memoryInsertCall).toBeGreaterThanOrEqual(0);
+    expect(dependencies.upsertVectors.mock.invocationCallOrder[0])
+      .toBeLessThan(db.insert.mock.invocationCallOrder[memoryInsertCall]);
+  });
+
   it('deletes a concurrent unique-index loser vector and returns the exact winner', async () => {
     const winner = { ...memoryRow('concurrent-winner', 'Direct fact'), contentHash: 'digest:Direct fact' };
     const { db, requestSet, requestUpdates } = createMemoryWriteDb({
