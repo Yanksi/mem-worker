@@ -286,6 +286,96 @@ describe('agent reclassification consistency', () => {
     expect(dependencies.upsertVectors).toHaveBeenCalledOnce();
   });
 
+  it('removes legacy graph state when retrying an already target-scoped memory', async () => {
+    const digest = await contentHash(content);
+    await seedMemory({ id: 'source-memory', userId: null, agentId: 'agent-1', createdAt: 1, digest });
+    await seedSourceGraph();
+
+    await processMem0AgentReclassificationJob(testEnv(), job);
+
+    expect(await memory('source-memory')).toEqual(expect.objectContaining({
+      user_id: null,
+      agent_id: 'agent-1',
+      deleted_at: null,
+    }));
+    expect(await graphState()).toEqual({ links: [], relationships: [] });
+    expect(dependencies.upsertVectors).toHaveBeenCalledOnce();
+  });
+
+  it('preserves graph state when an already target-scoped retry loses an ownership race', async () => {
+    const digest = await contentHash(content);
+    await seedMemory({ id: 'source-memory', userId: null, agentId: 'agent-1', createdAt: 1, digest });
+    await seedSourceGraph();
+    const originalGraph = await graphState();
+
+    await processMem0AgentReclassificationJob(testEnv(beforeFirstBatch(async () => {
+      await db.prepare(`
+        UPDATE memories SET user_id = 'legacy-user', agent_id = NULL WHERE id = 'source-memory'
+      `).run();
+    })), job);
+
+    expect(await memory('source-memory')).toEqual(expect.objectContaining({
+      user_id: 'legacy-user',
+      agent_id: null,
+      deleted_at: null,
+    }));
+    expect(await graphState()).toEqual(originalGraph);
+  });
+
+  it('resolves an already target-scoped collision before reindexing the surviving canonical', async () => {
+    const digest = await contentHash(content);
+    await db.prepare('DROP INDEX memories_active_agent_content_hash_unique_idx').run();
+    await seedMemory({ id: 'source-memory', userId: null, agentId: 'agent-1', createdAt: 2, digest });
+    await seedMemory({ id: 'target-memory', userId: null, agentId: 'agent-1', createdAt: 1, digest });
+
+    await processMem0AgentReclassificationJob(testEnv(), job);
+
+    expect(await memory('source-memory')).toEqual(expect.objectContaining({ deleted_at: expect.any(Number) }));
+    expect(await memory('target-memory')).toEqual(expect.objectContaining({ deleted_at: null }));
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).toHaveBeenCalledWith(vectorIndex, 'source-memory');
+  });
+
+  it('deletes a no-collision vector when its row is soft-deleted during upsert', async () => {
+    const digest = await contentHash(content);
+    const events: string[] = [];
+    await seedMemory({ id: 'source-memory', userId: 'legacy-user', agentId: null, createdAt: 1, digest });
+    dependencies.upsertVectors.mockImplementationOnce(async () => {
+      events.push('upsert');
+      await db.prepare("UPDATE memories SET deleted_at = 99 WHERE id = 'source-memory'").run();
+      return { mutationId: 'upsert-1' };
+    });
+    dependencies.deleteVector.mockImplementation(async (_index, id) => {
+      events.push(`delete:${id}`);
+    });
+
+    await processMem0AgentReclassificationJob(testEnv(), job);
+
+    expect(events).toEqual(['upsert', 'delete:source-memory']);
+    expect(await memory('source-memory')).toEqual(expect.objectContaining({ deleted_at: 99 }));
+  });
+
+  it('deletes a source-wins vector when its row is soft-deleted during upsert', async () => {
+    const digest = await contentHash(content);
+    const events: string[] = [];
+    await seedMemory({ id: 'source-memory', userId: 'legacy-user', agentId: null, createdAt: 1, digest });
+    await seedMemory({ id: 'target-memory', userId: null, agentId: 'agent-1', createdAt: 2, digest });
+    dependencies.upsertVectors.mockImplementationOnce(async () => {
+      events.push('upsert');
+      await db.prepare("UPDATE memories SET deleted_at = 99 WHERE id = 'source-memory'").run();
+      return { mutationId: 'upsert-1' };
+    });
+    dependencies.deleteVector.mockImplementation(async (_index, id) => {
+      events.push(`delete:${id}`);
+    });
+
+    await processMem0AgentReclassificationJob(testEnv(), job);
+
+    expect(events).toEqual(['upsert', 'delete:source-memory', 'delete:target-memory']);
+    expect(await memory('source-memory')).toEqual(expect.objectContaining({ deleted_at: 99 }));
+    expect(await memory('target-memory')).toEqual(expect.objectContaining({ deleted_at: expect.any(Number) }));
+  });
+
   it('moves a paired user-agent source into the target agent-only scope', async () => {
     const digest = await contentHash(content);
     await seedMemory({

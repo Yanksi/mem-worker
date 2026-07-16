@@ -834,8 +834,10 @@ export async function processMem0AgentReclassificationJob(env: Env, job: Reclass
     }
 
     if (isTargetScopedSource(source, job, digest)) {
-      await reindexReclassifiedMemory(env, source);
-      await cleanupSoftDeletedTargetVectors(env, source, job, digest);
+      await cleanupTargetScopedGraph(env, source);
+      const currentSource = await findReclassificationMemory(env, source.id);
+      if (currentSource === null || !isTargetScopedSource(currentSource, job, digest)) return;
+      source = currentSource;
     } else if (!isExpectedSource(source, job, digest)) {
       await cleanupSoftDeletedTargetVectors(env, source, job, digest);
       return;
@@ -846,11 +848,15 @@ export async function processMem0AgentReclassificationJob(env: Env, job: Reclass
 
     const collision = await findActiveExactMemory(env, targetScope, job.content, digest, job.id);
     if (collision === undefined) {
-      if (isTargetScopedSource(source, job, digest)) return;
+      if (isTargetScopedSource(source, job, digest)) {
+        await reindexReclassifiedMemory(env, source, job, digest);
+        await cleanupSoftDeletedTargetVectors(env, source, job, digest);
+        return;
+      }
       try {
         const moved = await moveReclassifiedMemory(env, source, job, digest);
         if (moved === null) continue;
-        await reindexReclassifiedMemory(env, moved);
+        await reindexReclassifiedMemory(env, moved, job, digest);
         return;
       } catch (error) {
         if (isMemoryContentUniqueConflict(error)) continue;
@@ -868,7 +874,7 @@ export async function processMem0AgentReclassificationJob(env: Env, job: Reclass
     if (sourceWins) {
       const currentSource = await findReclassificationMemory(env, source.id);
       if (currentSource !== null && isTargetScopedSource(currentSource, job, digest)) {
-        await reindexReclassifiedMemory(env, currentSource);
+        await reindexReclassifiedMemory(env, currentSource, job, digest);
       }
       await deleteVector(env.VECTORIZE, target.id);
     } else {
@@ -980,7 +986,27 @@ async function moveReclassifiedMemory(
     : null;
 }
 
-async function reindexReclassifiedMemory(env: Env, source: ReclassificationMemoryRow): Promise<void> {
+async function cleanupTargetScopedGraph(env: Env, source: ReclassificationMemoryRow): Promise<void> {
+  await env.DB.batch([
+    env.DB.prepare(`
+      DELETE FROM relationships
+      WHERE evidence_memory_id = ?
+        AND ${ACTIVE_MEMORY_GUARD}
+    `).bind(source.id, ...activeMemoryBindings(source)),
+    env.DB.prepare(`
+      DELETE FROM memory_entity_links
+      WHERE memory_id = ?
+        AND ${ACTIVE_MEMORY_GUARD}
+    `).bind(source.id, ...activeMemoryBindings(source)),
+  ]);
+}
+
+async function reindexReclassifiedMemory(
+  env: Env,
+  source: ReclassificationMemoryRow,
+  job: ReclassifyMem0AgentJob,
+  digest: string,
+): Promise<void> {
   const contentHash = source.contentHash;
   if (contentHash === null) throw new Error('Cannot reindex a memory without a content hash');
   const embedding = await embedText(env, source.content);
@@ -989,6 +1015,12 @@ async function reindexReclassifiedMemory(env: Env, source: ReclassificationMemor
     values: embedding,
     metadata: await memoryVectorMetadata({ ...source, contentHash }),
   }]);
+  const currentSource = await findReclassificationMemory(env, source.id);
+  if (currentSource === null
+    || !isTargetScopedSource(currentSource, job, digest)
+    || currentSource.hash !== source.hash) {
+    await deleteVector(env.VECTORIZE, source.id);
+  }
 }
 
 async function cleanupSoftDeletedTargetVectors(
@@ -1154,7 +1186,8 @@ function isTargetScopedSource(
   job: ReclassifyMem0AgentJob,
   digest: string,
 ): boolean {
-  return source.userId === null
+  return source.deletedAt === null
+    && source.userId === null
     && source.agentId === job.agentId
     && source.content === job.content
     && source.contentHash === digest;
