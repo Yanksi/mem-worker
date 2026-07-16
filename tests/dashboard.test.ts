@@ -241,6 +241,17 @@ describe('GET /dashboard', () => {
     expect(html).toContain('const readonly = false;');
   });
 
+  it('renders an inline dashboard script that parses as JavaScript', async () => {
+    const response = await worker.fetch(request('/dashboard', {
+      headers: { 'x-dashboard-password': 'dashboard-secret' },
+    }), env);
+    const html = await response.text();
+    const match = html.match(/<script>\s*(const readonly =[\s\S]*?)<\/script>/);
+
+    expect(match).not.toBeNull();
+    expect(() => new Function(match![1])).not.toThrow();
+  });
+
   it('renders the operator navigation and dashboard data endpoints', async () => {
     const response = await worker.fetch(request('/dashboard', {
       headers: { 'x-dashboard-password': 'dashboard-secret' },

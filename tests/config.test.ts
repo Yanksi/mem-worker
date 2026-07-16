@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 // @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
 import devVarsExample from '../.dev.vars.example?raw';
 // @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
+import dashboardPageSource from '../src/dashboard/page.ts?raw';
+// @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
 import implementationPlan from '../docs/superpowers/plans/2026-07-15-write-time-memory-deduplication.md?raw';
 // @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
 import packageJsonSource from '../package.json?raw';
@@ -23,6 +25,12 @@ const dedupDefaults = {
   DEDUP_SIMILARITY_THRESHOLD: '0.85',
   DEDUP_CANDIDATE_LIMIT: '8',
 };
+
+describe('dashboard client bundling', () => {
+  it('does not serialize bundler-transformed functions into browser JavaScript', () => {
+    expect(dashboardPageSource).not.toMatch(/\$\{[^}]+\.toString\(\)\}/);
+  });
+});
 
 function parseVars(source: string): Record<string, string> {
   const header = source.search(/^\[vars\]\s*$/m);

@@ -206,7 +206,55 @@ export function renderDashboard(readonly = false): string {
     const state = { entityType: '', entityId: '', users: [], offset: 0, nextOffset: null, memories: [], currentView: 'search', targetUserIdManuallyOverridden: false };
     const labels = { search: ['Search memory', 'Semantic recall across a selected memory entity.'], memories: ['All memories', 'Browse every active memory, newest first.'], settings: ['System settings', 'Manage memory write behavior.'], graph: ['Memory graph', 'Explore entities and the relationships inferred from stored memories.'], import: ['Import from Mem0', 'Queue a RawMemoryMigrationExport for direct memory migration.'] };
     const select = document.getElementById('user-select');
-    ${createDashboardSettingsController.toString()}
+    // Keep browser code literal: serializing a bundled function leaks esbuild helpers such as __name.
+    function createDashboardSettingsController(readOnly, checkbox, status, loadRequest, saveRequest) {
+      let authoritativeEnabled;
+      let settingsLoaded = false;
+      let loadPromise;
+      let requestGeneration = 0;
+      function showError(error) { status.textContent = error instanceof Error ? error.message : 'Request failed'; status.className = 'muted error'; }
+      async function load() {
+        if (settingsLoaded) return;
+        if (loadPromise !== undefined) return loadPromise;
+        checkbox.disabled = true; status.textContent = 'Loading...'; status.className = 'muted';
+        const generation = ++requestGeneration;
+        const request = (async () => {
+          try {
+            const body = await loadRequest();
+            if (generation !== requestGeneration) return;
+            authoritativeEnabled = body.semantic_dedup_enabled; settingsLoaded = true; checkbox.checked = authoritativeEnabled; status.textContent = ''; status.className = 'muted';
+          } catch (error) {
+            if (generation !== requestGeneration) return;
+            settingsLoaded = false; showError(error);
+          } finally {
+            if (generation === requestGeneration) checkbox.disabled = readOnly || !settingsLoaded;
+            loadPromise = undefined;
+          }
+        })();
+        loadPromise = request;
+        return request;
+      }
+      async function save() {
+        const enabled = checkbox.checked;
+        if (loadPromise !== undefined) await loadPromise;
+        if (!settingsLoaded || authoritativeEnabled === undefined) { checkbox.disabled = true; return; }
+        const previous = authoritativeEnabled;
+        checkbox.disabled = true; status.textContent = 'Saving...'; status.className = 'muted';
+        const generation = ++requestGeneration;
+        try {
+          const body = await saveRequest(enabled);
+          if (generation !== requestGeneration) return;
+          authoritativeEnabled = body.semantic_dedup_enabled; checkbox.checked = authoritativeEnabled; status.textContent = 'Saved'; status.className = 'muted';
+        } catch (error) {
+          if (generation !== requestGeneration) return;
+          checkbox.checked = previous; showError(error);
+        } finally {
+          if (generation === requestGeneration) checkbox.disabled = readOnly;
+        }
+      }
+      function clearStatus() { status.textContent = ''; status.className = 'muted'; }
+      return { load, save, clearStatus };
+    }
     const settingsCheckbox = document.getElementById('semantic-dedup-enabled');
     const settingsStatus = document.getElementById('settings-status');
     const settingsController = createDashboardSettingsController(readonly, settingsCheckbox, settingsStatus, () => api('/dashboard/api/settings'), (enabled) => api('/dashboard/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ semantic_dedup_enabled: enabled }) }));
@@ -223,7 +271,7 @@ export function renderDashboard(readonly = false): string {
     async function saveSettings() { await settingsController.save(); }
     async function search(event) { event.preventDefault(); const query = String(new FormData(event.currentTarget).get('query') || ''); const status = document.getElementById('search-status'); status.textContent = 'Searching...'; try { const body = await api('/dashboard/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ entity_type: state.entityType, entity_id: state.entityId, query }) }); renderRows(document.getElementById('search-results'), body.results, 'No relevant memories found.'); status.textContent = body.results.length + ' results'; } catch (error) { status.textContent = error.message; status.className = 'muted error'; } }
     function graphElements(body) { const nodeIds = new Set(body.entities.map((entity) => entity.id)); return [...body.entities.map((entity) => ({ group: 'nodes', data: { id: entity.id, label: entity.name, entity } })), ...body.relationships.filter((relationship) => nodeIds.has(relationship.source_entity_id) && nodeIds.has(relationship.target_entity_id)).map((relationship) => ({ group: 'edges', data: { id: relationship.id, source: relationship.source_entity_id, target: relationship.target_entity_id, label: relationship.relation_type } }))]; }
-    ${graphResponseMatchesSelection.toString()}
+    function graphResponseMatchesSelection(requestedEntityType, requestedEntityId, currentEntityType, currentEntityId) { return requestedEntityType === currentEntityType && requestedEntityId === currentEntityId; }
     async function loadGraph() { const graph = document.getElementById('graph'); const status = document.getElementById('graph-status'); const graphEntityType = state.entityType; const graphEntityId = state.entityId; if (graphEntityType !== 'user') { graph.replaceChildren(Object.assign(document.createElement('p'), { className: 'empty', textContent: 'Select the corresponding user entity to view its graph.' })); status.textContent = 'Memory graphs are available for user entities only.'; return; } status.textContent = 'Loading...'; try { if (!window.cytoscape) throw new Error('Graph library failed to load. Please reload the dashboard.'); const body = await api('/dashboard/api/graph?entity_type=user&entity_id=' + encodeURIComponent(graphEntityId)); if (!graphResponseMatchesSelection(graphEntityType, graphEntityId, state.entityType, state.entityId)) return; const canvas = document.createElement('div'); graph.replaceChildren(canvas); const cy = cytoscape({ container: canvas, elements: graphElements(body), userPanningEnabled: true, userZoomingEnabled: true, autoungrabify: false, style: [{ selector: 'node', style: { 'shape': 'round-rectangle', 'label': 'data(label)', 'width': 'label', 'height': 'label', 'padding': '18px', 'text-wrap': 'wrap', 'text-max-width': '132px', 'text-valign': 'center', 'text-halign': 'center', 'background-color': '#e1f3ea', 'border-color': '#176b5a', 'border-width': 1.5, 'color': '#1d252b', 'font-size': '12px' } }, { selector: 'edge', style: { 'curve-style': 'bezier', 'target-arrow-shape': 'triangle', 'target-arrow-color': '#aebdb5', 'line-color': '#aebdb5', 'width': 1.5, 'label': 'data(label)', 'font-size': '10px', 'color': '#63716c', 'text-rotation': 'autorotate', 'text-background-color': '#fff', 'text-background-opacity': 1, 'text-background-padding': '2px' } }], layout: { name: 'cose', animate: true, padding: 32, nodeRepulsion: 9000, idealEdgeLength: 130 } }); cy.on('tap', 'node', (event) => setGraphDetail(event.target.data('entity'))); cy.on('tap', (event) => { if (event.target === cy) document.getElementById('graph-detail').hidden = true; }); status.textContent = body.entities.length + ' entities | ' + body.relationships.length + ' relationships'; } catch (error) { if (!graphResponseMatchesSelection(graphEntityType, graphEntityId, state.entityType, state.entityId)) return; graph.replaceChildren(Object.assign(document.createElement('p'), { className: 'empty error', textContent: error.message })); status.textContent = 'Unable to load graph'; } }
     function filenameUserId(fileName) { return fileName.toLowerCase().endsWith('.json') ? fileName.slice(0, -5) : ''; }
     async function loadImportFile(event) { const file = event.currentTarget.files && event.currentTarget.files[0]; if (!file) return; const exportJson = document.getElementById('export-json'); exportJson.value = await file.text(); const target = document.getElementById('target-user-id'); const derivedUserId = filenameUserId(file.name); if (!state.targetUserIdManuallyOverridden && derivedUserId) target.value = derivedUserId; }
