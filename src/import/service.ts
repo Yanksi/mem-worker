@@ -260,6 +260,7 @@ export async function processMem0ImportJob(env: Env, job: Mem0ImportJob): Promis
       agentId: scope.agentId,
       runId: null,
       actorId: null,
+      contentHash: prepared.contentHash,
       metadataJson,
     };
     const embedding = prepared.embedding ?? await embedText(env, item.memory);
@@ -967,11 +968,13 @@ async function moveReclassifiedMemory(
 }
 
 async function reindexReclassifiedMemory(env: Env, source: ReclassificationMemoryRow): Promise<void> {
+  const contentHash = source.contentHash;
+  if (contentHash === null) throw new Error('Cannot reindex a memory without a content hash');
   const embedding = await embedText(env, source.content);
   await upsertVectors(env.VECTORIZE, [{
     id: source.id,
     values: embedding,
-    metadata: await memoryVectorMetadata(source),
+    metadata: await memoryVectorMetadata({ ...source, contentHash }),
   }]);
 }
 

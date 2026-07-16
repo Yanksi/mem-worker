@@ -107,7 +107,9 @@ dashboardRoutes.post('/api/memories/:id/reindex', async (context) => {
   if (scope === undefined) return context.json({ error: 'Validation failed' }, 400);
 
   const reindexed = await reindexDashboardMemory(context.env, scope.entityType, scope.entityId, context.req.param('id'));
-  return reindexed ? context.json({ ok: true }) : context.json({ error: 'Memory not found' }, 404);
+  return reindexed === null
+    ? context.json({ error: 'Memory not found' }, 404)
+    : context.json({ ok: true, mutation_id: reindexed.mutationId });
 });
 
 dashboardRoutes.post('/api/search', async (context) => {

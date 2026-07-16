@@ -331,6 +331,8 @@ npm test
 npm run typecheck
 ```
 
+The normal `npm test` lifecycle runs the Vitest suite followed by the maintenance Node tests. Focused commands remain supported: `npm test -- tests/config.test.ts` still runs the focused Vitest target and then the maintenance suite. `npm run test:maintenance` remains available for running only the maintenance suite.
+
 ## Provision Cloudflare resources
 
 `wrangler.toml` contains the current deployment's concrete D1 binding as a reference configuration. Forks and other operators must ensure `database_id` points to a D1 database in their own Cloudflare account, replacing the checked-in value only when their deployment flow does not do so. Existing operators should keep the valid checked-in binding when it already names the intended database.
@@ -399,19 +401,19 @@ Migration `0008` is intentionally not included in the repository yet. Keep the r
 2. Deploy phase-one code with semantic deduplication still off.
 3. Pause every write ingress, including Hermes and direct API mutations, Dashboard imports and reclassification, and any producer or dispatcher that can enqueue memory work.
 4. Drain the Queue completely, including active deliveries, retries, delayed messages, and backlog, and confirm no producer can refill it.
-5. Run `inspect` and review its report and backup.
-6. Run `apply --confirm`.
+5. Run `inspect`, review its report and backup, and record the exact backup path.
+6. Run `apply --confirm <inspection-artifact>` using that reviewed backup.
 7. Run `verify` and confirm that it succeeds in production.
 8. Only after successful production verification, create and apply migration `0008` while every writer remains paused. Review that migration before applying it with `npx wrangler d1 migrations apply DB --remote`.
 9. Resume writers only after migration `0008` has been applied and post-migration checks succeed.
 
-Keep every writer paused from step 3 through step 8. If `verify` reports asynchronous Vectorize cleanup still settling, rerun it while writers remain paused. Do not create migration `0008` based only on a local or staging result, and do not resume any ingress before it is reviewed and applied.
+Keep every writer paused from step 3 through step 8. Apply waits for Vectorize to process its last submitted mutation before reporting success; keep writers paused and investigate any barrier timeout or verification failure. Do not create migration `0008` based only on a local or staging result, and do not resume any ingress before it is reviewed and applied.
 
 The package commands are:
 
 ```sh
 npm run maintenance:dedup -- inspect
-npm run maintenance:dedup -- apply --confirm
+npm run maintenance:dedup -- apply --confirm backups/memory-deduplication-<timestamp>.json
 npm run maintenance:dedup -- verify
 ```
 
@@ -419,13 +421,15 @@ The equivalent direct commands are:
 
 ```sh
 node --env-file=.env scripts/migrate-memory-deduplication.mjs inspect
-node --env-file=.env scripts/migrate-memory-deduplication.mjs apply --confirm
+node --env-file=.env scripts/migrate-memory-deduplication.mjs apply --confirm backups/memory-deduplication-<timestamp>.json
 node --env-file=.env scripts/migrate-memory-deduplication.mjs verify
 ```
 
 The package script reads `.env` when it exists; the direct form shown above requires it. Set `CLOUDFLARE_API_TOKEN`, `MEM0_BASE_URL`, and `DASHBOARD_PASSWORD`; `CLOUDFLARE_ACCOUNT_ID` is optional when the token can resolve exactly one account. Use a narrowly scoped Cloudflare token, run maintenance from a secured workstation, and keep writers paused according to your incident and deployment procedures.
 
-`inspect` writes a timestamped JSON backup under `backups/` with restrictive permissions where the platform supports them. Inspection backups contain memory contents and must be protected as sensitive data: do not commit or share them, restrict access, and remove them according to your retention policy after verification. Review the inspection mapping before apply; `apply --confirm` backfills hashes, consolidates exact duplicates, removes stale vectors, and reindexes active memories with `scope_key`. `verify` checks hashes, duplicate groups, active/deleted vectors, and `scope_key` metadata.
+`inspect` writes a timestamped JSON backup under `backups/` with restrictive permissions where the platform supports them. Inspection backups contain memory contents and must be protected as sensitive data: do not commit or share them, restrict access, and remove them according to your retention policy after verification. Each inspection artifact carries an artifact schema, exact target configuration, inspected rows, planned mappings, and SHA-256 integrity fingerprint. Apply rejects target drift, artifact corruption, and any D1 state not reachable from the inspected rows through this artifact's ordered hash updates and loser soft-deletes, while allowing a safe resume after a partially committed prior apply.
+
+Apply uses the artifact's reviewed mappings, batch-reads active vectors, and reindexes only vectors whose `content_hash`, `memory_vector_schema`, or `scope_key` metadata is missing or stale. It captures mutation IDs from direct deletes and Dashboard upserts, then waits until `processedUpToMutation` equals the last submitted maintenance mutation before reporting success. `verify` checks D1 hashes and duplicate groups, active/deleted vector presence, and all three controlled vector fields: `content_hash`, `memory_vector_schema`, and `scope_key`.
 
 ## Manual deployment
 

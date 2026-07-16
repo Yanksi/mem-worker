@@ -252,6 +252,8 @@ describe('agent reclassification consistency', () => {
         run_id: 'run-1',
         actor_id: 'actor-1',
         scope_key: await scopeKey({ userId: null, agentId: 'agent-1' }),
+        content_hash: await contentHash(content),
+        memory_vector_schema: '1',
       },
     }]);
     expect(dependencies.deleteVector).toHaveBeenCalledWith(vectorIndex, 'target-memory');
@@ -298,6 +300,8 @@ describe('agent reclassification consistency', () => {
         run_id: 'run-1',
         actor_id: 'actor-1',
         scope_key: await scopeKey({ userId: null, agentId: 'agent-1' }),
+        content_hash: digest,
+        memory_vector_schema: '1',
       },
     }]);
     expect(dependencies.deleteVector).not.toHaveBeenCalled();

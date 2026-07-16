@@ -93,23 +93,24 @@ export async function reindexDashboardMemory(
   entityType: DashboardEntityType,
   entityId: string,
   memoryId: string,
-): Promise<boolean> {
+): Promise<{ mutationId: string } | null> {
   const column = dashboardScopeColumn(entityType);
   const row = await env.DB.prepare(`
     SELECT id, user_id AS userId, agent_id AS agentId, run_id AS runId,
-      actor_id AS actorId, content, metadata_json AS metadataJson
+      actor_id AS actorId, content, content_hash AS contentHash,
+      metadata_json AS metadataJson
     FROM memories
     WHERE id = ? AND ${column} = ? AND deleted_at IS NULL
   `).bind(memoryId, entityId).first<DashboardVectorRow>();
-  if (row === null) return false;
+  if (row === null) return null;
 
   const vector = await embedText(env, row.content);
-  await upsertVectors(env.VECTORIZE, [{
+  const mutation = await upsertVectors(env.VECTORIZE, [{
     id: row.id,
     values: vector,
     metadata: await memoryVectorMetadata(row),
   }]);
-  return true;
+  return { mutationId: mutation.mutationId };
 }
 
 function dashboardScopeColumn(entityType: DashboardEntityType): 'user_id' | 'agent_id' {
@@ -135,6 +136,7 @@ interface DashboardVectorRow {
   runId: string | null;
   actorId: string | null;
   content: string;
+  contentHash: string;
   metadataJson: string;
 }
 

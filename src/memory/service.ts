@@ -743,7 +743,7 @@ export async function updateMemory(env: Env, id: string, userId: string, request
   if (current === undefined) return null;
 
   const content = request.memory === undefined ? current.content : request.memory;
-  let nextContentHash = current.contentHash;
+  let nextContentHash = current.contentHash ?? await contentHash(current.content);
   if (content !== current.content) {
     nextContentHash = await contentHash(content);
     const duplicate = await findActiveExactMemory(

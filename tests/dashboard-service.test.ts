@@ -23,7 +23,7 @@ import {
   setDashboardSettings,
 } from '../src/dashboard/service';
 import type { Env } from '../src/env';
-import { scopeKey } from '../src/memory/identity';
+import { contentHash, scopeKey } from '../src/memory/identity';
 
 const env = workerEnv as unknown as Env;
 
@@ -33,7 +33,7 @@ afterEach(async () => {
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  await env.DB.prepare('CREATE TABLE memories (id TEXT PRIMARY KEY NOT NULL, user_id TEXT, agent_id TEXT, run_id TEXT, actor_id TEXT, content TEXT NOT NULL, metadata_json TEXT NOT NULL, hash TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER)').run();
+  await env.DB.prepare('CREATE TABLE memories (id TEXT PRIMARY KEY NOT NULL, user_id TEXT, agent_id TEXT, run_id TEXT, actor_id TEXT, content TEXT NOT NULL, content_hash TEXT, metadata_json TEXT NOT NULL, hash TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER)').run();
   await env.DB.prepare('CREATE TABLE memory_history (id TEXT PRIMARY KEY NOT NULL, memory_id TEXT NOT NULL, operation TEXT NOT NULL, content TEXT NOT NULL, metadata_json TEXT NOT NULL, hash TEXT NOT NULL, created_at INTEGER NOT NULL)').run();
 });
 
@@ -59,13 +59,13 @@ async function seedMemory({
   deletedAt?: number | null;
 }): Promise<void> {
   await env.DB.prepare(`
-    INSERT INTO memories (id, user_id, agent_id, run_id, actor_id, content, metadata_json, hash, created_at, updated_at, deleted_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(id, userId, agentId, runId, actorId, content, JSON.stringify(metadata), id, createdAt, createdAt, deletedAt).run();
+    INSERT INTO memories (id, user_id, agent_id, run_id, actor_id, content, content_hash, metadata_json, hash, created_at, updated_at, deleted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(id, userId, agentId, runId, actorId, content, await contentHash(content), JSON.stringify(metadata), id, createdAt, createdAt, deletedAt).run();
 }
 
 describe('dashboard memory reindexing', () => {
-  it('uses shared vector metadata including the exact paired owner scope key', async () => {
+  it('uses shared vector metadata including the D1 content hash and returns the mutation ID', async () => {
     const testEnv = { DB: env.DB, VECTORIZE: {} as VectorizeIndex } as Env;
     await seedMemory({
       id: 'paired-memory',
@@ -85,8 +85,11 @@ describe('dashboard memory reindexing', () => {
       createdAt: 1,
     });
     dependencies.embedText.mockResolvedValue([0.25, 0.75]);
+    dependencies.upsertVectors.mockResolvedValue({ mutationId: 'mutation-42' });
 
-    await expect(reindexDashboardMemory(testEnv, 'user', 'user-1', 'paired-memory')).resolves.toBe(true);
+    await expect(reindexDashboardMemory(testEnv, 'user', 'user-1', 'paired-memory')).resolves.toEqual({
+      mutationId: 'mutation-42',
+    });
 
     expect(dependencies.embedText.mock.calls[0][1]).toBe('Remember the paired scope.');
     expect(dependencies.upsertVectors.mock.calls[0][0]).toBe(testEnv.VECTORIZE);
@@ -101,6 +104,8 @@ describe('dashboard memory reindexing', () => {
         run_id: 'run-1',
         actor_id: 'actor-1',
         scope_key: await scopeKey({ userId: 'user-1', agentId: 'agent-1' }),
+        content_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+        memory_vector_schema: '1',
       },
     }]);
   });

@@ -8,7 +8,11 @@ const RESERVED_VECTOR_METADATA_KEYS = new Set([
   'run_id',
   'actor_id',
   'scope_key',
+  'content_hash',
+  'memory_vector_schema',
 ]);
+
+export const MEMORY_VECTOR_SCHEMA_VERSION = '1';
 
 export interface MemoryOwnerScope {
   userId: string | null;
@@ -18,6 +22,7 @@ export interface MemoryOwnerScope {
 export interface MemoryVectorSource extends MemoryOwnerScope {
   runId: string | null;
   actorId: string | null;
+  contentHash: string;
   metadataJson: string;
 }
 
@@ -46,6 +51,8 @@ export async function memoryVectorMetadata(
     ...(row.runId === null ? {} : { run_id: row.runId }),
     ...(row.actorId === null ? {} : { actor_id: row.actorId }),
     scope_key: await scopeKey(row),
+    content_hash: row.contentHash,
+    memory_vector_schema: MEMORY_VECTOR_SCHEMA_VERSION,
   };
 }
 

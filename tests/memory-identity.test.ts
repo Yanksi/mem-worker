@@ -54,6 +54,7 @@ describe('memory identity', () => {
       agentId: 'agent-1',
       runId: 'run-1',
       actorId: null,
+      contentHash: 'content-digest',
       metadataJson: JSON.stringify({
         label: 'travel',
         score: 0.75,
@@ -63,6 +64,8 @@ describe('memory identity', () => {
         ignoredObject: { nested: true },
         user_id: 'spoofed-user',
         scope_key: 'spoofed-scope',
+        content_hash: 'spoofed-content-digest',
+        memory_vector_schema: 'spoofed-schema',
       }),
     };
 
@@ -74,6 +77,8 @@ describe('memory identity', () => {
       agent_id: 'agent-1',
       run_id: 'run-1',
       scope_key: await scopeKey(row),
+      content_hash: 'content-digest',
+      memory_vector_schema: '1',
     });
   });
 
@@ -84,10 +89,13 @@ describe('memory identity', () => {
       ...scope,
       runId: null,
       actorId: null,
+      contentHash: 'content-digest',
       metadataJson,
     })).resolves.toEqual({
       agent_id: 'agent-1',
       scope_key: await scopeKey(scope),
+      content_hash: 'content-digest',
+      memory_vector_schema: '1',
     });
   });
 
@@ -97,6 +105,7 @@ describe('memory identity', () => {
       agentId: null,
       runId: null,
       actorId: null,
+      contentHash: 'content-digest',
       metadataJson: JSON.stringify({
         label: 'kept',
         user_id: 'spoofed-user',
@@ -104,12 +113,16 @@ describe('memory identity', () => {
         run_id: 'spoofed-run',
         actor_id: 'spoofed-actor',
         scope_key: 'spoofed-scope',
+        content_hash: 'spoofed-content-digest',
+        memory_vector_schema: 'spoofed-schema',
       }),
     };
 
     await expect(memoryVectorMetadata(row)).resolves.toEqual({
       label: 'kept',
       scope_key: await scopeKey(row),
+      content_hash: 'content-digest',
+      memory_vector_schema: '1',
     });
   });
 });

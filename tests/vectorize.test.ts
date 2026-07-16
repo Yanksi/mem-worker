@@ -18,12 +18,12 @@ expectTypeOf<EntityVector['metadata']['user_id']>().toEqualTypeOf<string>();
 describe('Vectorize wrappers', () => {
   it('upserts records and deletes individual vector IDs', async () => {
     const index = {
-      upsert: vi.fn().mockResolvedValue({}),
+      upsert: vi.fn().mockResolvedValue({ mutationId: 'mutation-1' }),
       deleteByIds: vi.fn().mockResolvedValue({}),
     } as unknown as VectorizeIndex;
     const records = [{ id: 'memory-123', values: [0.1, 0.2], metadata: { user_id: 'user-123' } }];
 
-    await upsertVectors(index, records);
+    await expect(upsertVectors(index, records)).resolves.toEqual({ mutationId: 'mutation-1' });
     await deleteVector(index, 'memory-123');
 
     expect(index.upsert).toHaveBeenCalledWith(records);

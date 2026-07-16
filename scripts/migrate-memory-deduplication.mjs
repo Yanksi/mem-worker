@@ -6,6 +6,7 @@ import {
   duplicateMappings,
   pendingHashUpdates,
   scopeKey,
+  sha256Hex,
 } from './lib/memory-deduplication.mjs';
 
 const CLOUDFLARE_API_BASE_URL = 'https://api.cloudflare.com/client/v4';
@@ -13,10 +14,14 @@ const ACCOUNT_PAGE_SIZE = 50;
 const MEMORY_PAGE_SIZE = 500;
 const D1_BATCH_SIZE = 50;
 const VECTOR_BATCH_SIZE = 100;
+const VECTOR_MUTATION_TIMEOUT_MS = 2 * 60 * 1_000;
+const VECTOR_MUTATION_POLL_INTERVAL_MS = 1_000;
+const MEMORY_VECTOR_SCHEMA_VERSION = '1';
+const INSPECTION_ARTIFACT_SCHEMA = 'memory-deduplication-inspection/v1';
 
 export const USAGE = `Usage:
   node --env-file=.env scripts/migrate-memory-deduplication.mjs inspect
-  node --env-file=.env scripts/migrate-memory-deduplication.mjs apply --confirm
+  node --env-file=.env scripts/migrate-memory-deduplication.mjs apply --confirm <inspection-artifact.json>
   node --env-file=.env scripts/migrate-memory-deduplication.mjs verify`;
 
 class ApplyConfirmationError extends Error {}
@@ -30,10 +35,14 @@ export function parseArguments(argv) {
 
   if (command === 'apply') {
     if (!rest.includes('--confirm')) throw new ApplyConfirmationError('apply requires --confirm');
-    if (rest.length !== 1 || rest[0] !== '--confirm') {
+    if (rest.length === 1 && rest[0] === '--confirm') {
+      throw new Error(`apply requires an inspection artifact path\n${USAGE}`);
+    }
+    if (rest.length !== 2 || rest[0] !== '--confirm'
+      || rest[1].trim() === '' || rest[1].startsWith('--')) {
       throw new Error(`unexpected arguments for apply\n${USAGE}`);
     }
-    return { command, confirm: true };
+    return { command, confirm: true, artifactPath: rest[1] };
   }
 
   if (rest.length !== 0) throw new Error(`unexpected arguments for ${command}\n${USAGE}`);
@@ -208,7 +217,23 @@ export function createCloudflareClient({
         `/accounts/${encodeURIComponent(accountId)}/vectorize/v2/indexes/${encodeURIComponent(indexName)}/delete_by_ids`,
         { method: 'POST', body: { ids } },
       );
-      return envelope.result;
+      if (typeof envelope.result?.mutationId !== 'string' || envelope.result.mutationId === '') {
+        throw new Error('Vectorize delete_by_ids failed: invalid mutation result');
+      }
+      return { mutationId: envelope.result.mutationId };
+    },
+
+    async getVectorIndexInfo(accountId, indexName) {
+      const envelope = await request(
+        'Vectorize index info',
+        `/accounts/${encodeURIComponent(accountId)}/vectorize/v2/indexes/${encodeURIComponent(indexName)}/info`,
+      );
+      const processed = envelope.result?.processedUpToMutation;
+      if (!((typeof processed === 'number' && Number.isFinite(processed))
+        || (typeof processed === 'string' && processed !== ''))) {
+        throw new Error('Vectorize index info failed: invalid index info');
+      }
+      return { processedUpToMutation: processed };
     },
 
     async getVectors(accountId, indexName, ids) {
@@ -408,8 +433,43 @@ export async function deleteVectorIds({
 }) {
   const uniqueIds = [...new Set(ids)];
   const batches = chunks(uniqueIds, batchSize);
-  for (const batch of batches) await deleteVectors(batch);
-  return { ids: uniqueIds.length, batches: batches.length };
+  let lastMutationId = null;
+  for (const batch of batches) {
+    const result = await deleteVectors(batch);
+    if (typeof result?.mutationId !== 'string' || result.mutationId === '') {
+      throw new Error('Vectorize delete_by_ids returned an invalid mutation ID');
+    }
+    lastMutationId = result.mutationId;
+  }
+  return { ids: uniqueIds.length, batches: batches.length, lastMutationId };
+}
+
+export async function waitForVectorMutation({
+  mutationId,
+  getIndexInfo,
+  timeoutMs = VECTOR_MUTATION_TIMEOUT_MS,
+  pollIntervalMs = VECTOR_MUTATION_POLL_INTERVAL_MS,
+  now = Date.now,
+  sleep = (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds)),
+}) {
+  if (typeof mutationId !== 'string' || mutationId === '') throw new Error('Vectorize mutation ID is invalid');
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error('Vectorize mutation timeout is invalid');
+  if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) throw new Error('Vectorize mutation poll interval is invalid');
+  const startedAt = now();
+  let polls = 0;
+  while (true) {
+    if (polls > 0 && now() - startedAt >= timeoutMs) {
+      throw new Error(`timed out waiting for Vectorize mutation ${mutationId}`);
+    }
+    const info = await getIndexInfo();
+    polls += 1;
+    if (String(info?.processedUpToMutation) === mutationId) return { mutationId, polls };
+    const remainingMs = timeoutMs - (now() - startedAt);
+    if (remainingMs <= 0) {
+      throw new Error(`timed out waiting for Vectorize mutation ${mutationId}`);
+    }
+    await sleep(Math.min(pollIntervalMs, remainingMs));
+  }
 }
 
 export async function loginDashboard({ baseUrl, password, fetchImpl, secrets = [] }) {
@@ -480,6 +540,7 @@ export async function reindexActiveMemories({ rows, baseUrl, session, password, 
     }
   };
 
+  let lastMutationId = null;
   for (const { row, scope } of requests) {
     let response = await requestReindex(row, scope);
     if (response.status === 401) {
@@ -497,9 +558,42 @@ export async function reindexActiveMemories({ rows, baseUrl, session, password, 
       throw new Error(`Dashboard reindex failed for memory ${row.id}: HTTP ${response.status}`);
     }
     const body = await response.json().catch(() => null);
-    if (body?.ok !== true) throw new Error(`Dashboard reindex failed for memory ${row.id}: invalid response`);
+    if (body?.ok !== true || typeof body.mutation_id !== 'string' || body.mutation_id === '') {
+      throw new Error(`Dashboard reindex failed for memory ${row.id}: invalid response`);
+    }
+    lastMutationId = body.mutation_id;
   }
-  return { reindexed: requests.length };
+  return { reindexed: requests.length, lastMutationId };
+}
+
+async function vectorMapForRows({ rows, getVectors, vectorBatchSize }) {
+  const vectors = [];
+  for (const batch of chunks(rows.map((row) => row.id), vectorBatchSize)) {
+    const result = await getVectors(batch);
+    if (!Array.isArray(result)) throw new Error('Vectorize get_by_ids returned invalid vectors');
+    vectors.push(...result);
+  }
+  return new Map(vectors.map((vector) => [vector.id, vector]));
+}
+
+async function vectorMatchesRow(vector, row) {
+  return vector?.metadata?.scope_key === await scopeKey(row)
+    && vector.metadata.content_hash === row.content_hash
+    && vector.metadata.memory_vector_schema === MEMORY_VECTOR_SCHEMA_VERSION;
+}
+
+export async function pendingReindexRows({
+  rows,
+  getVectors,
+  vectorBatchSize = VECTOR_BATCH_SIZE,
+}) {
+  const activeRows = rows.filter((row) => row.deleted_at === null);
+  const vectorsById = await vectorMapForRows({ rows: activeRows, getVectors, vectorBatchSize });
+  const pending = [];
+  for (const row of activeRows) {
+    if (!await vectorMatchesRow(vectorsById.get(row.id), row)) pending.push(row);
+  }
+  return pending;
 }
 
 export async function verifyMemoryState({
@@ -517,21 +611,17 @@ export async function verifyMemoryState({
   const duplicateGroupCount = new Set(duplicates.map(({ canonicalId }) => canonicalId)).size;
   const activeRows = rows.filter((row) => row.deleted_at === null);
   const deletedRows = rows.filter((row) => row.deleted_at !== null);
-  const vectors = [];
-  for (const batch of chunks(activeRows.map((row) => row.id), vectorBatchSize)) {
-    const result = await getVectors(batch);
-    if (!Array.isArray(result)) throw new Error('Vectorize get_by_ids returned invalid vectors');
-    vectors.push(...result);
-  }
+  const vectorsById = await vectorMapForRows({ rows: activeRows, getVectors, vectorBatchSize });
   const deletedVectors = [];
   for (const batch of chunks(deletedRows.map((row) => row.id), vectorBatchSize)) {
     const result = await getVectors(batch);
     if (!Array.isArray(result)) throw new Error('Vectorize get_by_ids returned invalid vectors');
     deletedVectors.push(...result);
   }
-  const vectorsById = new Map(vectors.map((vector) => [vector.id, vector]));
   const missingVectorIds = [];
   const wrongScopeKeyIds = [];
+  const wrongContentHashIds = [];
+  const wrongVectorSchemaIds = [];
   for (const row of activeRows) {
     const vector = vectorsById.get(row.id);
     if (vector === undefined) {
@@ -539,6 +629,8 @@ export async function verifyMemoryState({
       continue;
     }
     if (vector.metadata?.scope_key !== await scopeKey(row)) wrongScopeKeyIds.push(row.id);
+    if (vector.metadata?.content_hash !== row.content_hash) wrongContentHashIds.push(row.id);
+    if (vector.metadata?.memory_vector_schema !== MEMORY_VECTOR_SCHEMA_VERSION) wrongVectorSchemaIds.push(row.id);
   }
   const returnedDeletedIds = new Set(deletedVectors.map((vector) => vector.id));
   const unexpectedDeletedVectorIds = deletedRows
@@ -558,6 +650,10 @@ export async function verifyMemoryState({
     missing_active_vector_ids: missingVectorIds,
     wrong_scope_key_count: wrongScopeKeyIds.length,
     wrong_scope_key_ids: wrongScopeKeyIds,
+    wrong_content_hash_count: wrongContentHashIds.length,
+    wrong_content_hash_ids: wrongContentHashIds,
+    wrong_vector_schema_count: wrongVectorSchemaIds.length,
+    wrong_vector_schema_ids: wrongVectorSchemaIds,
     unexpected_deleted_vector_count: unexpectedDeletedVectorIds.length,
     unexpected_deleted_vector_ids: unexpectedDeletedVectorIds,
     operator_note: 'Vectorize mutations are asynchronous; deleted vectors may remain visible briefly. If verification follows apply immediately and fails, wait briefly and rerun verify.',
@@ -567,6 +663,8 @@ export async function verifyMemoryState({
       && report.active_duplicate_group_count === 0
       && report.missing_active_vector_count === 0
       && report.wrong_scope_key_count === 0
+      && report.wrong_content_hash_count === 0
+      && report.wrong_vector_schema_count === 0
       && report.unexpected_deleted_vector_count === 0,
     report,
   };
@@ -574,7 +672,12 @@ export async function verifyMemoryState({
 
 async function inspectionPlan(rows) {
   const hashUpdates = await pendingHashUpdates(rows);
-  const duplicates = duplicateMappings(rows);
+  const updatesById = new Map(hashUpdates.map((update) => [update.id, update.contentHash]));
+  const plannedRows = rows.map((row) => ({
+    ...row,
+    content_hash: updatesById.get(row.id) ?? row.content_hash,
+  }));
+  const duplicates = duplicateMappings(plannedRows);
   const activeRows = rows.filter((row) => row.deleted_at === null);
   const duplicateLoserIds = duplicates.map(({ loserId }) => loserId);
   const unreindexableIds = unreindexableActiveMemoryIds(rows);
@@ -594,6 +697,168 @@ async function inspectionPlan(rows) {
   };
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    )).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function artifactTarget(config) {
+  return {
+    account_id: config.accountId,
+    database_id: config.databaseId,
+    vectorize_index_name: config.vectorizeIndexName,
+    mem0_base_url: config.mem0BaseUrl,
+  };
+}
+
+function artifactPayload(artifact) {
+  const payload = { ...artifact };
+  delete payload.integrity;
+  return payload;
+}
+
+export async function createInspectionArtifact({ rows, config, createdAt }) {
+  const report = await inspectionPlan(rows);
+  const payload = {
+    artifact_schema: INSPECTION_ARTIFACT_SCHEMA,
+    created_at: createdAt.toISOString(),
+    target: artifactTarget(config),
+    rows,
+    mappings: report.active_duplicate_mappings,
+    report,
+  };
+  return {
+    ...payload,
+    integrity: {
+      algorithm: 'sha256',
+      fingerprint: await sha256Hex(canonicalJson(payload)),
+    },
+  };
+}
+
+function isRecord(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function validateArtifactRows(rows) {
+  if (!Array.isArray(rows)) throw new Error('inspection artifact rows are invalid');
+  const ids = new Set();
+  for (const row of rows) {
+    const valid = isRecord(row)
+      && typeof row.id === 'string' && row.id !== ''
+      && (row.user_id === null || typeof row.user_id === 'string')
+      && (row.agent_id === null || typeof row.agent_id === 'string')
+      && typeof row.content === 'string'
+      && (row.content_hash === null || typeof row.content_hash === 'string')
+      && Number.isFinite(Number(row.created_at))
+      && (row.deleted_at === null || Number.isFinite(Number(row.deleted_at)));
+    if (!valid) throw new Error('inspection artifact rows are invalid');
+    if (ids.has(row.id)) throw new Error(`inspection artifact contains duplicate memory ${row.id}`);
+    ids.add(row.id);
+  }
+}
+
+export async function validateInspectionArtifact(source, config) {
+  let artifact;
+  try {
+    artifact = JSON.parse(source);
+  } catch {
+    throw new Error('inspection artifact contains invalid JSON');
+  }
+  if (!isRecord(artifact) || artifact.artifact_schema !== INSPECTION_ARTIFACT_SCHEMA) {
+    throw new Error('inspection artifact schema is unsupported');
+  }
+  if (!isRecord(artifact.integrity) || artifact.integrity.algorithm !== 'sha256'
+    || typeof artifact.integrity.fingerprint !== 'string') {
+    throw new Error('inspection artifact integrity metadata is invalid');
+  }
+  const fingerprint = await sha256Hex(canonicalJson(artifactPayload(artifact)));
+  if (fingerprint !== artifact.integrity.fingerprint) {
+    throw new Error('inspection artifact integrity fingerprint mismatch');
+  }
+  if (canonicalJson(artifact.target) !== canonicalJson(artifactTarget(config))) {
+    throw new Error('inspection artifact target does not match current configuration');
+  }
+  if (typeof artifact.created_at !== 'string' || Number.isNaN(Date.parse(artifact.created_at))) {
+    throw new Error('inspection artifact created_at is invalid');
+  }
+  validateArtifactRows(artifact.rows);
+  const expectedReport = await inspectionPlan(artifact.rows);
+  if (canonicalJson(artifact.report) !== canonicalJson(expectedReport)
+    || canonicalJson(artifact.mappings) !== canonicalJson(expectedReport.active_duplicate_mappings)) {
+    throw new Error('inspection artifact plan does not match its rows');
+  }
+  return artifact;
+}
+
+export async function validateApplyState(artifact, currentRows) {
+  validateArtifactRows(currentRows);
+  const inspectedById = new Map(artifact.rows.map((row) => [row.id, row]));
+  const currentById = new Map(currentRows.map((row) => [row.id, row]));
+  for (const row of currentRows) {
+    if (!inspectedById.has(row.id)) throw new Error(`inspection artifact state has new memory ${row.id}`);
+  }
+  for (const row of artifact.rows) {
+    if (!currentById.has(row.id)) throw new Error(`inspection artifact state is missing memory ${row.id}`);
+  }
+
+  const updates = artifact.report.pending_hash_updates;
+  const updatesById = new Map(updates.map((update) => [update.id, update.contentHash]));
+  const loserIds = new Set(artifact.mappings.map(({ loserId }) => loserId));
+  for (const inspected of artifact.rows) {
+    const current = currentById.get(inspected.id);
+    for (const field of ['user_id', 'agent_id', 'content', 'created_at']) {
+      if (current[field] !== inspected[field]) {
+        throw new Error(`inspection artifact state memory ${inspected.id} changed ${field}`);
+      }
+    }
+    const plannedHash = updatesById.get(inspected.id);
+    if (current.content_hash !== inspected.content_hash
+      && (plannedHash === undefined || current.content_hash !== plannedHash)) {
+      throw new Error(`inspection artifact state memory ${inspected.id} has an unplanned content_hash`);
+    }
+    if (inspected.deleted_at !== null) {
+      if (current.deleted_at !== inspected.deleted_at) {
+        throw new Error(`inspection artifact state memory ${inspected.id} has an unplanned deletion transition`);
+      }
+    } else if (current.deleted_at !== null && !loserIds.has(inspected.id)) {
+      throw new Error(`inspection artifact state memory ${inspected.id} has an unplanned deletion transition`);
+    }
+  }
+
+  let foundPendingHash = false;
+  for (const update of updates) {
+    const current = currentById.get(update.id);
+    const inspected = inspectedById.get(update.id);
+    if (current.content_hash === inspected.content_hash) {
+      foundPendingHash = true;
+    } else if (foundPendingHash) {
+      throw new Error('inspection artifact state has unreachable hash commit ordering');
+    }
+  }
+  let foundPendingDelete = false;
+  let hasCommittedDelete = false;
+  for (const mapping of artifact.mappings) {
+    const current = currentById.get(mapping.loserId);
+    const committed = current.deleted_at !== null;
+    if (!committed) foundPendingDelete = true;
+    else {
+      hasCommittedDelete = true;
+      if (foundPendingDelete) throw new Error('inspection artifact state has unreachable deletion ordering');
+    }
+  }
+  if (hasCommittedDelete && updates.some((update) => (
+    currentById.get(update.id).content_hash !== update.contentHash
+  ))) {
+    throw new Error('inspection artifact state deleted a loser before hash backfill completed');
+  }
+}
+
 function safeTimestamp(date) {
   return date.toISOString().replaceAll(':', '-');
 }
@@ -602,17 +867,7 @@ async function writeInspectionBackup({ rows, report, config, now, mkdirImpl, wri
   const directory = 'backups';
   await mkdirImpl(directory, { recursive: true });
   const path = join(directory, `memory-deduplication-${safeTimestamp(now)}.json`);
-  const backup = {
-    created_at: now.toISOString(),
-    config: {
-      account_id: config.accountId,
-      database_id: config.databaseId,
-      vectorize_index_name: config.vectorizeIndexName,
-      mem0_base_url: config.mem0BaseUrl,
-    },
-    report,
-    rows,
-  };
+  const backup = await createInspectionArtifact({ rows, config, createdAt: now });
   await writeFileImpl(path, `${JSON.stringify(backup, null, 2)}\n`, {
     encoding: 'utf8',
     mode: 0o600,
@@ -649,6 +904,7 @@ export async function runCommand(parsed, {
   const queryD1 = (body) => client.queryD1(config.accountId, config.databaseId, body);
   const getVectors = (ids) => client.getVectors(config.accountId, config.vectorizeIndexName, ids);
   const deleteVectors = (ids) => client.deleteVectors(config.accountId, config.vectorizeIndexName, ids);
+  const getIndexInfo = () => client.getVectorIndexInfo(config.accountId, config.vectorizeIndexName);
 
   if (parsed.command === 'inspect') {
     const rows = await pageAllMemories(queryD1);
@@ -673,7 +929,12 @@ export async function runCommand(parsed, {
     return result.ok ? 0 : 1;
   }
 
+  const artifact = await validateInspectionArtifact(
+    await readFileImpl(parsed.artifactPath, 'utf8'),
+    config,
+  );
   const initialRows = await pageAllMemories(queryD1);
+  await validateApplyState(artifact, initialRows);
   const unreindexableIds = unreindexableActiveMemoryIds(initialRows);
   if (unreindexableIds.length > 0) {
     const memoryLabel = unreindexableIds.length === 1 ? 'memory' : 'memories';
@@ -688,7 +949,10 @@ export async function runCommand(parsed, {
       fetchImpl,
     }),
   };
-  const hashUpdates = await pendingHashUpdates(initialRows);
+  const initialRowsById = new Map(initialRows.map((row) => [row.id, row]));
+  const hashUpdates = artifact.report.pending_hash_updates.filter((update) => (
+    initialRowsById.get(update.id).content_hash !== update.contentHash
+  ));
   const hashResult = await applyHashUpdates({
     rows: initialRows,
     updates: hashUpdates,
@@ -696,18 +960,22 @@ export async function runCommand(parsed, {
   });
 
   const hashedRows = await pageAllMemories(queryD1);
-  const remainingHashUpdates = await pendingHashUpdates(hashedRows);
+  await validateApplyState(artifact, hashedRows);
+  const remainingHashUpdates = artifact.report.pending_hash_updates.filter((update) => (
+    hashedRows.find((row) => row.id === update.id).content_hash !== update.contentHash
+  ));
   if (remainingHashUpdates.length > 0) {
     throw new Error(`hash backfill is incomplete for ${remainingHashUpdates.length} rows; rerun apply --confirm`);
   }
 
-  const mappings = duplicateMappings(hashedRows);
+  const mappings = artifact.mappings;
   const decisiveLoserIds = [];
   for (const mapping of mappings) {
     if (await cleanupDuplicate({ mapping, queryD1 })) decisiveLoserIds.push(mapping.loserId);
   }
 
   const finalRows = await pageAllMemories(queryD1);
+  await validateApplyState(artifact, finalRows);
   const remainingMappings = duplicateMappings(finalRows);
   if (remainingMappings.length > 0) {
     throw new Error(`duplicate cleanup is incomplete for ${remainingMappings.length} rows; rerun apply --confirm`);
@@ -718,16 +986,21 @@ export async function runCommand(parsed, {
     .map((row) => row.id);
   const vectorDeleteResult = await deleteVectorIds({ ids: deletedVectorIds, deleteVectors });
   const activeRows = finalRows.filter((row) => row.deleted_at === null);
-  let reindexResult = { reindexed: 0 };
-  if (activeRows.length > 0) {
+  const pendingReindex = await pendingReindexRows({ rows: activeRows, getVectors });
+  let reindexResult = { reindexed: 0, lastMutationId: null };
+  if (pendingReindex.length > 0) {
     reindexResult = await reindexActiveMemories({
-      rows: activeRows,
+      rows: pendingReindex,
       baseUrl: config.mem0BaseUrl,
       session,
       password: runtime.dashboardPassword,
       fetchImpl,
     });
   }
+  const lastMutationId = reindexResult.lastMutationId ?? vectorDeleteResult.lastMutationId;
+  const mutationBarrier = lastMutationId === null
+    ? null
+    : await waitForVectorMutation({ mutationId: lastMutationId, getIndexInfo });
 
   const report = {
     initial_row_count: initialRows.length,
@@ -737,8 +1010,10 @@ export async function runCommand(parsed, {
     duplicates_decisively_merged: decisiveLoserIds.length,
     deleted_vector_ids_submitted: vectorDeleteResult.ids,
     vector_delete_batches: vectorDeleteResult.batches,
+    active_memories_already_converged: activeRows.length - pendingReindex.length,
     active_memories_reindexed: reindexResult.reindexed,
-    operator_note: 'Vectorize deletions are asynchronous. Run verify after mutations have settled; rerun verify later if needed.',
+    last_vector_mutation_id: lastMutationId,
+    vector_mutation_barrier_polls: mutationBarrier?.polls ?? 0,
   };
   logger.log(JSON.stringify({ command: 'apply', ok: true, report }, null, 2));
   return 0;

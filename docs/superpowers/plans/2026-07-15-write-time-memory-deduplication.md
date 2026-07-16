@@ -880,27 +880,35 @@ Supported commands are:
 
 ```text
 node --env-file=.env scripts/migrate-memory-deduplication.mjs inspect
-node --env-file=.env scripts/migrate-memory-deduplication.mjs apply --confirm
+node --env-file=.env scripts/migrate-memory-deduplication.mjs apply --confirm backups/memory-deduplication-<timestamp>.json
 node --env-file=.env scripts/migrate-memory-deduplication.mjs verify
 ```
 
 `inspect` is read-only and writes
-`backups/memory-deduplication-<timestamp>.json`. `apply` refuses to run without
-`--confirm`, pages all memories by `(created_at,id)`, updates only mismatched
-`content_hash` values through parameterized D1 REST batches, requeries rows
-before selecting duplicate groups, performs graph-preserving loser cleanup in
-D1 batches, deletes loser vectors with
-`POST /vectorize/v2/indexes/{name}/delete_by_ids`, logs into the deployed
-Dashboard, and invokes the existing per-memory reindex endpoint once for every
-remaining active memory so every vector receives `scope_key`. Every operation
-is idempotent, so rerunning `apply --confirm` resumes by recomputing only the
-remaining work. `verify` uses D1 plus Vectorize `get_by_ids` batches and exits
-nonzero unless null/mismatched hashes, active exact groups, missing active
-vectors, and missing/wrong `scope_key` metadata are all zero.
+`backups/memory-deduplication-<timestamp>.json` with an artifact schema, exact
+account/database/index/base-URL target, inspected rows, planned hash updates and
+mappings, and a deterministic SHA-256 integrity fingerprint. `apply` refuses to
+run without `--confirm` plus that exact reviewed artifact path. Before mutation,
+it validates the fingerprint and target and rejects new, missing, ownership- or
+content-changed rows, unplanned deletion transitions, and states not reachable
+through the artifact's ordered hash and loser-soft-delete steps. A partially
+committed prior apply remains safely resumable.
+
+Apply uses only the artifact's plan, deletes stale vectors, batch-reads active
+vectors, and calls Dashboard reindex only for vectors whose `content_hash`,
+`memory_vector_schema`, or `scope_key` metadata does not match D1. Delete and
+Dashboard-upsert mutation IDs are captured. With writers paused, apply polls the
+Vectorize index-info endpoint until `processedUpToMutation` equals the last
+submitted maintenance mutation, including all-deleted runs whose last mutation
+is a delete. It cannot report success before this bounded barrier. `verify` uses
+D1 plus Vectorize `get_by_ids` batches and exits nonzero unless hashes, duplicate
+groups, vector presence, `content_hash`, `memory_vector_schema`, and `scope_key`
+are all converged.
 
 Add:
 
 ```json
+"posttest": "npm run test:maintenance",
 "test:maintenance": "node --test scripts/lib/memory-deduplication.test.mjs",
 "maintenance:dedup": "node --env-file=.env scripts/migrate-memory-deduplication.mjs"
 ```
@@ -1079,14 +1087,16 @@ Expected: a backup report under `backups/` containing row count, pending hash up
 - [ ] **Step 3: Require explicit operator confirmation, then apply and verify**
 
 ```powershell
-npm run maintenance:dedup -- apply --confirm
+npm run maintenance:dedup -- apply --confirm backups/memory-deduplication-<timestamp>.json
 npm run maintenance:dedup -- verify
 ```
 
-Expected: apply completes all resumable phases; verify reports zero
+Expected: apply validates the exact reviewed inspection artifact, completes all
+resumable phases, waits for its final Vectorize mutation, and verify reports zero
 null/mismatched hashes, zero active exact duplicate groups, zero missing active
-vectors, zero wrong/missing `scope_key` metadata, and exits `0`. Do not create or
-apply `0008` if verification fails.
+vectors, and zero wrong/missing `content_hash`, `memory_vector_schema`, or
+`scope_key` metadata, and exits `0`. Do not create or apply `0008` if verification
+fails.
 
 - [ ] **Step 4: Write the failing final-schema test**
 

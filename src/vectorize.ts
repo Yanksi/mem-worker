@@ -14,8 +14,15 @@ export interface MemoryVectorSearchOptions {
   candidatePool?: number;
 }
 
-export function upsertVectors(index: VectorizeIndex, records: VectorizeVector[]) {
-  return index.upsert(records);
+export async function upsertVectors(
+  index: VectorizeIndex,
+  records: VectorizeVector[],
+): Promise<{ mutationId: string }> {
+  const result: unknown = await index.upsert(records);
+  if (!isRecord(result) || typeof result.mutationId !== 'string' || result.mutationId === '') {
+    throw new Error('Vectorize upsert returned an invalid mutation ID');
+  }
+  return { mutationId: result.mutationId };
 }
 
 export function upsertEntityVectors(index: VectorizeIndex, records: EntityVector[]) {

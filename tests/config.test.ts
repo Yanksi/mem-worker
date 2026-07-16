@@ -5,6 +5,8 @@ import devVarsExample from '../.dev.vars.example?raw';
 // @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
 import implementationPlan from '../docs/superpowers/plans/2026-07-15-write-time-memory-deduplication.md?raw';
 // @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
+import packageJsonSource from '../package.json?raw';
+// @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
 import readme from '../README.md?raw';
 // @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
 import wranglerConfig from '../wrangler.toml?raw';
@@ -13,6 +15,7 @@ import remotePreviewConfig from '../wrangler.remote-preview.toml?raw';
 
 // @ts-expect-error Vite supplies import.meta.glob at test runtime.
 const migrationFiles = Object.keys(import.meta.glob('../src/migrations/*.sql'));
+const packageJson = JSON.parse(packageJsonSource) as { scripts: Record<string, string> };
 
 const dedupDefaults = {
   DEDUP_LLM_API_BASE_URL: 'https://openrouter.ai/api/v1',
@@ -188,15 +191,27 @@ describe('semantic deduplication documentation', () => {
   it('documents the maintenance commands and security boundary', () => {
     for (const command of [
       'npm run maintenance:dedup -- inspect',
-      'npm run maintenance:dedup -- apply --confirm',
+      'npm run maintenance:dedup -- apply --confirm backups/memory-deduplication-<timestamp>.json',
       'npm run maintenance:dedup -- verify',
       'node --env-file=.env scripts/migrate-memory-deduplication.mjs inspect',
-      'node --env-file=.env scripts/migrate-memory-deduplication.mjs apply --confirm',
+      'node --env-file=.env scripts/migrate-memory-deduplication.mjs apply --confirm backups/memory-deduplication-<timestamp>.json',
       'node --env-file=.env scripts/migrate-memory-deduplication.mjs verify',
     ]) {
       expect(readme).toContain(command);
     }
     expect(readme).toContain('Inspection backups contain memory contents and must be protected as sensitive data');
+    expect(readme).toContain('artifact schema, exact target configuration, inspected rows, planned mappings, and SHA-256 integrity fingerprint');
+    expect(readme).toContain('Apply rejects target drift, artifact corruption, and any D1 state not reachable from the inspected rows through this artifact');
+    expect(readme).toContain('waits until `processedUpToMutation` equals the last submitted maintenance mutation');
+    expect(readme).toContain('`content_hash`, `memory_vector_schema`, and `scope_key`');
+  });
+
+  it('runs maintenance tests from the normal npm test lifecycle while preserving focused Vitest arguments', () => {
+    expect(packageJson.scripts.test).toContain('vitest run');
+    expect(packageJson.scripts.test).toContain('--exclude scripts/lib/memory-deduplication.test.mjs');
+    expect(packageJson.scripts.posttest).toBe('npm run test:maintenance');
+    expect(packageJson.scripts['test:maintenance']).toBe('node --test scripts/lib/memory-deduplication.test.mjs');
+    expect(readme).toContain('`npm test -- tests/config.test.ts` still runs the focused Vitest target and then the maintenance suite');
   });
 
   it('keeps every write ingress paused from maintenance through migration 0008', () => {
@@ -205,8 +220,8 @@ describe('semantic deduplication documentation', () => {
     const deploy = readme.indexOf('Deploy phase-one code with semantic deduplication still off.');
     const pause = readme.indexOf('Pause every write ingress');
     const drain = readme.indexOf('Drain the Queue completely, including active deliveries, retries, delayed messages, and backlog');
-    const inspect = readme.indexOf('Run `inspect` and review its report and backup.');
-    const apply = readme.indexOf('Run `apply --confirm`.');
+    const inspect = readme.indexOf('Run `inspect`, review its report and backup, and record the exact backup path.');
+    const apply = readme.indexOf('Run `apply --confirm <inspection-artifact>` using that reviewed backup.');
     const verify = readme.indexOf('Run `verify` and confirm that it succeeds in production.');
     const create0008 = readme.indexOf('Only after successful production verification, create and apply migration `0008`');
     const resume = readme.indexOf('Resume writers only after migration `0008` has been applied');
@@ -249,6 +264,10 @@ describe('semantic deduplication documentation', () => {
     expect(applyAndVerify).toBeLessThan(enforce);
     expect(enforce).toBeLessThan(resume);
     expect(implementationPlan).toContain('phase-one exact matching runs on every write but remains race-prone until production-verified migration `0008` adds database uniqueness');
+    expect(implementationPlan).toContain('npm run maintenance:dedup -- apply --confirm backups/memory-deduplication-<timestamp>.json');
+    expect(implementationPlan).toContain('processedUpToMutation');
+    expect(implementationPlan).toContain('memory_vector_schema');
+    expect(implementationPlan).toContain('artifact schema');
   });
 
   it('asserts migration 0008 is not in the phase-one inventory', () => {

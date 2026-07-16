@@ -283,7 +283,7 @@ describe('dashboard operator API', () => {
   });
 
   it('reindexes one authenticated agent memory without changing its scope', async () => {
-    dashboardService.reindexDashboardMemory.mockResolvedValue(true);
+    dashboardService.reindexDashboardMemory.mockResolvedValue({ mutationId: 'mutation-42' });
 
     const response = await worker.fetch(request('/dashboard/api/memories/memory-1/reindex', {
       method: 'POST',
@@ -292,7 +292,7 @@ describe('dashboard operator API', () => {
     }), env);
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ ok: true });
+    await expect(response.json()).resolves.toEqual({ ok: true, mutation_id: 'mutation-42' });
     expect(dashboardService.reindexDashboardMemory).toHaveBeenCalledWith(env, 'agent', 'hermes', 'memory-1');
   });
 
