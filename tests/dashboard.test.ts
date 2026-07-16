@@ -266,6 +266,7 @@ describe('GET /dashboard', () => {
     expect(html).toContain('integrity="sha384-K+k+ywfDuvV9dwg+bwsVE0WGkrTnqFamaER+ydBgMFQTtlI0jdI9no9AjkQHwh/T"');
     expect(html).toContain('crossorigin="anonymous"');
     expect(html).toContain('function graphElements(body)');
+    expect(html).toContain("nodeIds.has(relationship.source_entity_id) && nodeIds.has(relationship.target_entity_id)");
     expect(html).toContain('cytoscape({');
     expect(html).toContain("'text-wrap': 'wrap'");
     expect(html).toContain("'shape': 'round-rectangle'");

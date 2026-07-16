@@ -10,7 +10,7 @@ import {
   setDashboardSettings,
 } from '../dashboard/service';
 import type { Env } from '../env';
-import { listEntities, listRelationships } from '../graph/service';
+import { listAllEntities, listRelationships } from '../graph/service';
 import { enqueueMem0AgentReclassification, enqueueMem0Import } from '../import/service';
 import { DashboardMem0ImportRequest } from '../import/types';
 import { searchMemories } from '../memory/service';
@@ -157,10 +157,15 @@ dashboardRoutes.get('/api/graph', async (context) => {
   const scope = dashboardScope(context.req.query('entity_type'), context.req.query('entity_id'), context.req.query('user_id'));
   if (scope === undefined || scope.entityType !== 'user') return context.json({ error: 'Memory graphs are available for user entities only' }, 400);
   const [entities, relationships] = await Promise.all([
-    listEntities(context.env, scope.entityId),
+    listAllEntities(context.env, scope.entityId),
     listRelationships(context.env, scope.entityId),
   ]);
-  return context.json({ entities, relationships });
+  const entityIds = new Set(entities.map((entity) => entity.id));
+  const completeRelationships = relationships.filter((relationship) => (
+    entityIds.has(relationship.source_entity_id)
+    && entityIds.has(relationship.target_entity_id)
+  ));
+  return context.json({ entities, relationships: completeRelationships });
 });
 
 async function createDashboardSessionCookie(password: string, requestUrl: string): Promise<string> {

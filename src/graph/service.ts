@@ -35,6 +35,12 @@ export async function listEntities(env: Env, userId: string): Promise<EntityResp
   return rows.map(toEntityResponse);
 }
 
+export async function listAllEntities(env: Env, userId: string): Promise<EntityResponse[]> {
+  const rows = await createDb(env.DB).select().from(entities).where(eq(entities.userId, userId))
+    .orderBy(desc(entities.createdAt)).all();
+  return rows.map(toEntityResponse);
+}
+
 export async function getEntity(env: Env, userId: string, id: string): Promise<EntityResponse | null> {
   const row = await createDb(env.DB).select().from(entities).where(and(
     eq(entities.userId, userId),

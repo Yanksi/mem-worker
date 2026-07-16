@@ -56,6 +56,7 @@ function createSelectDb() {
     from,
     where,
     limit,
+    all,
   };
 }
 
@@ -86,6 +87,20 @@ describe('graph service', () => {
     }
     expect(containsValue(query.where.mock.calls[1][0], entities.id)).toBe(true);
     expect(containsValue(query.where.mock.calls[1][0], 'entity-123')).toBe(true);
+  });
+
+  it('lists every owned entity for a complete dashboard graph', async () => {
+    const query = createSelectDb();
+    graphDependencies.createDb.mockReturnValue(query.db);
+    const actual = await vi.importActual<typeof import('../src/graph/service')>('../src/graph/service');
+
+    await actual.listAllEntities(env, 'user-123');
+
+    expect(query.from).toHaveBeenCalledWith(entities);
+    expect(query.limit).not.toHaveBeenCalled();
+    expect(query.all).toHaveBeenCalledTimes(1);
+    expect(containsValue(query.where.mock.calls[0][0], entities.userId)).toBe(true);
+    expect(containsValue(query.where.mock.calls[0][0], 'user-123')).toBe(true);
   });
 
   it('filters relationships by owner and either source or target entity', async () => {
