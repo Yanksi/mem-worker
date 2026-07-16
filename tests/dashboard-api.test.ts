@@ -16,6 +16,7 @@ const vectorize = vi.hoisted(() => ({
 }));
 const graphService = vi.hoisted(() => ({
   listEntities: vi.fn(),
+  listAllEntities: vi.fn(),
   listRelationships: vi.fn(),
 }));
 const memoryService = vi.hoisted(() => ({
@@ -327,8 +328,11 @@ describe('dashboard operator API', () => {
 
   it('searches and loads a graph for the selected user', async () => {
     memoryService.searchMemories.mockResolvedValue([{ id: 'memory-1' }]);
-    graphService.listEntities.mockResolvedValue([{ id: 'entity-1' }]);
-    graphService.listRelationships.mockResolvedValue([{ id: 'relationship-1' }]);
+    graphService.listAllEntities.mockResolvedValue([{ id: 'entity-1' }, { id: 'entity-2' }]);
+    graphService.listRelationships.mockResolvedValue([
+      { id: 'relationship-1', source_entity_id: 'entity-1', target_entity_id: 'entity-2' },
+      { id: 'orphaned-relationship', source_entity_id: 'missing-entity', target_entity_id: 'entity-2' },
+    ]);
     const cookie = await dashboardCookie();
 
     const search = await worker.fetch(request('/dashboard/api/search', {
@@ -342,13 +346,13 @@ describe('dashboard operator API', () => {
 
     await expect(search.json()).resolves.toEqual({ results: [{ id: 'memory-1' }] });
     await expect(graph.json()).resolves.toEqual({
-      entities: [{ id: 'entity-1' }],
-      relationships: [{ id: 'relationship-1' }],
+      entities: [{ id: 'entity-1' }, { id: 'entity-2' }],
+      relationships: [{ id: 'relationship-1', source_entity_id: 'entity-1', target_entity_id: 'entity-2' }],
     });
     expect(memoryService.searchMemories).toHaveBeenCalledWith(env, {
       user_id: 'discord:42', query: 'city', limit: 10, filters: {},
     });
-    expect(graphService.listEntities).toHaveBeenCalledWith(env, 'discord:42');
+    expect(graphService.listAllEntities).toHaveBeenCalledWith(env, 'discord:42');
     expect(graphService.listRelationships).toHaveBeenCalledWith(env, 'discord:42');
   });
 
